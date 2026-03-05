@@ -22,6 +22,7 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.9",
     "pyright>=1.1",
+    "pytest-timeout>=2.4.0",
 ]
 
 [tool.ruff]
@@ -40,4 +41,5 @@ include = ["src"]
 testpaths = ["tests"]
 markers = [
     "integration: tests that require xctrace (deselect with '-m \"not integration\"')",
+    "mcp_integration: tests that exercise MCP tools via Claude Code CLI",
 ]

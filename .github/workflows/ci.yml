@@ -30,4 +30,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync
-      - run: uv run pytest tests/ -v -m "not integration"
+      - run: uv run pytest tests/ -v -m "not integration and not mcp_integration"
+
+  mcp-integration:
+    runs-on: macos-latest
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+      - name: Run MCP integration tests
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: uv run pytest tests/test_mcp_integration.py -v -m mcp_integration --timeout=180
+        if: env.ANTHROPIC_API_KEY != ''
