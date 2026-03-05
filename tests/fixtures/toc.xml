@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<trace-toc>
+    <run number="1">
+        <info>
+            <target>
+                <device uuid="ACEF90FD-9BB0-56E0-9A50-8EE09341798B" model="MacBook Pro" name="Robert's MacBook Pro" os-version="15.7.3 (24G419)" platform="macOS"/>
+                <process type="attached" return-exit-status="0" name="Finder" pid="751" termination-reason="exit(0)"/>
+            </target>
+            <summary>
+                <start-date>2026-03-05T17:27:38.879Z</start-date>
+                <end-date>2026-03-05T17:27:42.278Z</end-date>
+                <duration>3.398757</duration>
+                <end-reason>Time limit reached</end-reason>
+                <instruments-version>26.0 (17C529)</instruments-version>
+                <template-name>Blank</template-name>
+                <recording-mode>Deferred</recording-mode>
+                <time-limit>3 seconds</time-limit>
+            </summary>
+        </info>
+        <processes>
+            <process name="kernel.release.t6041" pid="0" path="/System/Library/Kernels/kernel.release.t6041"/>
+            <process name="Finder" pid="751" path="/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"/>
+        </processes>
+        <data>
+            <table target-pid="SINGLE" high-frequency-sampling="0" schema="cpu-profile" needs-kernel-callstack="0"/>
+            <table hangs-threshold="100" schema="potential-hangs" target-pid="ALL"/>
+            <table schema="os-signpost" target-pid="ALL"/>
+            <table target-pid="ALL" schema="os-signpost-interval" layout-scope="name"/>
+            <table schema="process-info"/>
+            <table schema="thread-info"/>
+        </data>
+        <tracks/>
+    </run>
+</trace-toc>
