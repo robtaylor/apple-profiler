@@ -155,15 +155,17 @@ class TraceFile:
                 for frame_elem in stack_elem.children_by_tag("frame"):
                     backtrace.append(_extract_frame(frame_elem))
 
-            samples.append(CpuSample(
-                time_ns=time_elem.int_value if time_elem else 0,
-                thread=thread,
-                process=process,
-                core=core_elem.value if core_elem else "",
-                state=state_elem.value if state_elem else "",
-                weight=weight_elem.int_value if weight_elem else 0,
-                backtrace=backtrace,
-            ))
+            samples.append(
+                CpuSample(
+                    time_ns=time_elem.int_value if time_elem else 0,
+                    thread=thread,
+                    process=process,
+                    core=core_elem.value if core_elem else "",
+                    state=state_elem.value if state_elem else "",
+                    weight=weight_elem.int_value if weight_elem else 0,
+                    backtrace=backtrace,
+                )
+            )
 
         return samples
 
@@ -194,13 +196,15 @@ class TraceFile:
             process = _extract_process(process_elem)
             thread = _extract_thread(thread_elem, process)
 
-            result.append(Hang(
-                start_ns=start_elem.int_value if start_elem else 0,
-                duration_ns=duration_elem.int_value if duration_elem else 0,
-                hang_type=hang_type_elem.value if hang_type_elem else "",
-                thread=thread,
-                process=process,
-            ))
+            result.append(
+                Hang(
+                    start_ns=start_elem.int_value if start_elem else 0,
+                    duration_ns=duration_elem.int_value if duration_elem else 0,
+                    hang_type=hang_type_elem.value if hang_type_elem else "",
+                    thread=thread,
+                    process=process,
+                )
+            )
 
         return result
 
@@ -244,18 +248,20 @@ class TraceFile:
             process = _extract_process(process_elem)
             thread = _extract_thread(thread_elem, process)
 
-            result.append(SignpostEvent(
-                time_ns=time_elem.int_value if time_elem else 0,
-                event_type=event_type_elem.value if event_type_elem else "",
-                name=sp_name,
-                subsystem=sp_subsystem,
-                category=sp_category,
-                message=message_elem.value if message_elem else "",
-                scope=scope_elem.value if scope_elem and scope_elem.tag != "sentinel" else None,
-                identifier=identifier_elem.int_value if identifier_elem else 0,
-                thread=thread,
-                process=process,
-            ))
+            result.append(
+                SignpostEvent(
+                    time_ns=time_elem.int_value if time_elem else 0,
+                    event_type=event_type_elem.value if event_type_elem else "",
+                    name=sp_name,
+                    subsystem=sp_subsystem,
+                    category=sp_category,
+                    message=message_elem.value if message_elem else "",
+                    scope=scope_elem.value if scope_elem and scope_elem.tag != "sentinel" else None,
+                    identifier=identifier_elem.int_value if identifier_elem else 0,
+                    thread=thread,
+                    process=process,
+                )
+            )
 
         return result
 
@@ -299,19 +305,21 @@ class TraceFile:
             start_thread = _extract_thread(start_thread_elem, process)
             end_thread = _extract_thread(end_thread_elem, process)
 
-            result.append(SignpostInterval(
-                start_ns=start_elem.int_value if start_elem else 0,
-                duration_ns=duration_elem.int_value if duration_elem else 0,
-                name=sp_name,
-                subsystem=sp_subsystem,
-                category=sp_category,
-                identifier=identifier_elem.int_value if identifier_elem else 0,
-                process=process,
-                start_thread=start_thread,
-                end_thread=end_thread,
-                start_message=start_msg_elem.value if start_msg_elem else "",
-                end_message=end_msg_elem.value if end_msg_elem else "",
-            ))
+            result.append(
+                SignpostInterval(
+                    start_ns=start_elem.int_value if start_elem else 0,
+                    duration_ns=duration_elem.int_value if duration_elem else 0,
+                    name=sp_name,
+                    subsystem=sp_subsystem,
+                    category=sp_category,
+                    identifier=identifier_elem.int_value if identifier_elem else 0,
+                    process=process,
+                    start_thread=start_thread,
+                    end_thread=end_thread,
+                    start_message=start_msg_elem.value if start_msg_elem else "",
+                    end_message=end_msg_elem.value if end_msg_elem else "",
+                )
+            )
 
         return result
 

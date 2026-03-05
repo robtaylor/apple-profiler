@@ -120,9 +120,7 @@ class TestRealSignpostParser:
         assert "end-thread" in mnemonics
         assert "signature" in mnemonics  # extra column not in hand-crafted fixtures
 
-    def test_sentinel_handling_in_signpost_events(
-        self, real_signpost_events_xml: str
-    ) -> None:
+    def test_sentinel_handling_in_signpost_events(self, real_signpost_events_xml: str) -> None:
         """Real signpost data has sentinel elements for missing backtrace/message."""
         table = parse_table_xml(real_signpost_events_xml)
         sentinel_count = 0
@@ -139,9 +137,7 @@ class TestRealSignpostParser:
 class TestRealTraceFileFinder:
     """Test TraceFile API against real Finder trace data."""
 
-    def _make_trace(
-        self, real_finder_toc_xml: str, real_finder_cpu_profile_xml: str
-    ) -> TraceFile:
+    def _make_trace(self, real_finder_toc_xml: str, real_finder_cpu_profile_xml: str) -> TraceFile:
         table_map = {"cpu-profile": real_finder_cpu_profile_xml}
 
         def loader(schema: str, kwargs: dict[str, str]) -> str:
@@ -152,9 +148,7 @@ class TestRealTraceFileFinder:
 
         return TraceFile.from_xml(real_finder_toc_xml, table_loader=loader)
 
-    def test_info(
-        self, real_finder_toc_xml: str, real_finder_cpu_profile_xml: str
-    ) -> None:
+    def test_info(self, real_finder_toc_xml: str, real_finder_cpu_profile_xml: str) -> None:
         t = self._make_trace(real_finder_toc_xml, real_finder_cpu_profile_xml)
         info = t.info
         assert "MacBook Pro" in info.device_name
@@ -165,18 +159,14 @@ class TestRealTraceFileFinder:
         assert info.target_pid == 751
         assert info.duration_seconds > 3.0
 
-    def test_tables(
-        self, real_finder_toc_xml: str, real_finder_cpu_profile_xml: str
-    ) -> None:
+    def test_tables(self, real_finder_toc_xml: str, real_finder_cpu_profile_xml: str) -> None:
         t = self._make_trace(real_finder_toc_xml, real_finder_cpu_profile_xml)
         tables = t.tables()
         schemas = [tb.schema for tb in tables]
         assert "cpu-profile" in schemas
         assert "kdebug" in schemas  # real traces have kdebug tables
 
-    def test_cpu_samples(
-        self, real_finder_toc_xml: str, real_finder_cpu_profile_xml: str
-    ) -> None:
+    def test_cpu_samples(self, real_finder_toc_xml: str, real_finder_cpu_profile_xml: str) -> None:
         t = self._make_trace(real_finder_toc_xml, real_finder_cpu_profile_xml)
         samples = t.cpu_samples()
         assert len(samples) == 91

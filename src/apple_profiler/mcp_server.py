@@ -114,18 +114,14 @@ class TracePathInput(BaseModel):
     """Input requiring a trace file path."""
 
     model_config = ConfigDict(str_strip_whitespace=True)
-    trace_path: str = Field(
-        ..., description="Path to the .trace file", min_length=1
-    )
+    trace_path: str = Field(..., description="Path to the .trace file", min_length=1)
 
 
 class CpuSamplesInput(BaseModel):
     """Input for querying CPU samples."""
 
     model_config = ConfigDict(str_strip_whitespace=True)
-    trace_path: str = Field(
-        ..., description="Path to the .trace file", min_length=1
-    )
+    trace_path: str = Field(..., description="Path to the .trace file", min_length=1)
     limit: int | None = Field(
         default=None,
         description="Maximum number of samples to return. None returns all.",
@@ -137,9 +133,7 @@ class TopFunctionsInput(BaseModel):
     """Input for top functions query."""
 
     model_config = ConfigDict(str_strip_whitespace=True)
-    trace_path: str = Field(
-        ..., description="Path to the .trace file", min_length=1
-    )
+    trace_path: str = Field(..., description="Path to the .trace file", min_length=1)
     n: int = Field(
         default=20,
         description="Number of top functions to return",
@@ -152,9 +146,7 @@ class SignpostFilterInput(BaseModel):
     """Input for querying signpost events or intervals with filtering."""
 
     model_config = ConfigDict(str_strip_whitespace=True)
-    trace_path: str = Field(
-        ..., description="Path to the .trace file", min_length=1
-    )
+    trace_path: str = Field(..., description="Path to the .trace file", min_length=1)
     subsystem: str | None = Field(
         default=None, description="Filter by subsystem (e.g., 'com.apple.SkyLight')"
     )
@@ -198,30 +190,28 @@ async def profiler_open_trace(params: TracePathInput) -> str:
         t = _get_trace(params.trace_path)
         info = t.info
         tables = t.tables()
-        return json.dumps({
-            "info": {
-                "device_name": info.device_name,
-                "device_model": info.device_model,
-                "os_version": info.os_version,
-                "platform": info.platform,
-                "start_date": info.start_date,
-                "end_date": info.end_date,
-                "duration_seconds": info.duration_seconds,
-                "instruments_version": info.instruments_version,
-                "template_name": info.template_name,
-                "recording_mode": info.recording_mode,
-                "end_reason": info.end_reason,
-                "target_process": info.target_process,
-                "target_pid": info.target_pid,
+        return json.dumps(
+            {
+                "info": {
+                    "device_name": info.device_name,
+                    "device_model": info.device_model,
+                    "os_version": info.os_version,
+                    "platform": info.platform,
+                    "start_date": info.start_date,
+                    "end_date": info.end_date,
+                    "duration_seconds": info.duration_seconds,
+                    "instruments_version": info.instruments_version,
+                    "template_name": info.template_name,
+                    "recording_mode": info.recording_mode,
+                    "end_reason": info.end_reason,
+                    "target_process": info.target_process,
+                    "target_pid": info.target_pid,
+                },
+                "tables": [{"schema": tb.schema, "attributes": tb.attributes} for tb in tables],
+                "processes": [{"pid": p.pid, "name": p.name} for p in t.processes()],
             },
-            "tables": [
-                {"schema": tb.schema, "attributes": tb.attributes}
-                for tb in tables
-            ],
-            "processes": [
-                {"pid": p.pid, "name": p.name} for p in t.processes()
-            ],
-        }, indent=2)
+            indent=2,
+        )
     except Exception as e:
         return f"Error opening trace: {e}"
 
@@ -252,11 +242,14 @@ async def profiler_cpu_samples(params: CpuSamplesInput) -> str:
         samples = t.cpu_samples()
         if params.limit is not None:
             samples = samples[: params.limit]
-        return json.dumps({
-            "total_samples": len(t.cpu_samples()),
-            "returned": len(samples),
-            "samples": [_sample_dict(s) for s in samples],
-        }, indent=2)
+        return json.dumps(
+            {
+                "total_samples": len(t.cpu_samples()),
+                "returned": len(samples),
+                "samples": [_sample_dict(s) for s in samples],
+            },
+            indent=2,
+        )
     except Exception as e:
         return f"Error reading CPU samples: {e}"
 
@@ -285,12 +278,14 @@ async def profiler_top_functions(params: TopFunctionsInput) -> str:
         if not t.has_table("cpu-profile"):
             return "Error: This trace does not contain CPU profile data."
         top = t.top_functions(params.n)
-        return json.dumps({
-            "top_functions": [
-                {"function": name, "total_weight": weight}
-                for name, weight in top
-            ],
-        }, indent=2)
+        return json.dumps(
+            {
+                "top_functions": [
+                    {"function": name, "total_weight": weight} for name, weight in top
+                ],
+            },
+            indent=2,
+        )
     except Exception as e:
         return f"Error computing top functions: {e}"
 
@@ -319,10 +314,13 @@ async def profiler_hangs(params: TracePathInput) -> str:
         if not t.has_table("potential-hangs"):
             return "Error: This trace does not contain hang detection data."
         hangs = t.hangs()
-        return json.dumps({
-            "total_hangs": len(hangs),
-            "hangs": [_hang_dict(h) for h in hangs],
-        }, indent=2)
+        return json.dumps(
+            {
+                "total_hangs": len(hangs),
+                "hangs": [_hang_dict(h) for h in hangs],
+            },
+            indent=2,
+        )
     except Exception as e:
         return f"Error reading hangs: {e}"
 
@@ -358,11 +356,14 @@ async def profiler_signpost_events(params: SignpostFilterInput) -> str:
         total = len(events)
         if params.limit is not None:
             events = events[: params.limit]
-        return json.dumps({
-            "total_events": total,
-            "returned": len(events),
-            "events": [_signpost_event_dict(e) for e in events],
-        }, indent=2)
+        return json.dumps(
+            {
+                "total_events": total,
+                "returned": len(events),
+                "events": [_signpost_event_dict(e) for e in events],
+            },
+            indent=2,
+        )
     except Exception as e:
         return f"Error reading signpost events: {e}"
 
@@ -398,11 +399,14 @@ async def profiler_signpost_intervals(params: SignpostFilterInput) -> str:
         total = len(intervals)
         if params.limit is not None:
             intervals = intervals[: params.limit]
-        return json.dumps({
-            "total_intervals": total,
-            "returned": len(intervals),
-            "intervals": [_signpost_interval_dict(i) for i in intervals],
-        }, indent=2)
+        return json.dumps(
+            {
+                "total_intervals": total,
+                "returned": len(intervals),
+                "intervals": [_signpost_interval_dict(i) for i in intervals],
+            },
+            indent=2,
+        )
     except Exception as e:
         return f"Error reading signpost intervals: {e}"
 
@@ -429,13 +433,13 @@ async def profiler_list_tables(params: TracePathInput) -> str:
     try:
         t = _get_trace(params.trace_path)
         tables = t.tables()
-        return json.dumps({
-            "total_tables": len(tables),
-            "tables": [
-                {"schema": tb.schema, "attributes": tb.attributes}
-                for tb in tables
-            ],
-        }, indent=2)
+        return json.dumps(
+            {
+                "total_tables": len(tables),
+                "tables": [{"schema": tb.schema, "attributes": tb.attributes} for tb in tables],
+            },
+            indent=2,
+        )
     except Exception as e:
         return f"Error listing tables: {e}"
 

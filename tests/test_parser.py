@@ -61,9 +61,7 @@ class TestSchemaParser:
         assert table.schema_name == "cpu-profile"
         assert len(table.columns) == 7
         mnemonics = [c.mnemonic for c in table.columns]
-        assert mnemonics == [
-            "time", "thread", "process", "core", "thread-state", "weight", "stack"
-        ]
+        assert mnemonics == ["time", "thread", "process", "core", "thread-state", "weight", "stack"]
 
     def test_hangs_schema(self, potential_hangs_xml: str) -> None:
         table = parse_table_xml(potential_hangs_xml)

@@ -153,13 +153,17 @@ def parse_table_xml(xml_string: str) -> ParsedTable:
             mnemonic_el = col.find("mnemonic")
             name_el = col.find("name")
             eng_type_el = col.find("engineering-type")
-            columns.append(SchemaColumn(
-                mnemonic=mnemonic_el.text if mnemonic_el is not None and mnemonic_el.text else "",
-                name=name_el.text if name_el is not None and name_el.text else "",
-                engineering_type=(
-                    eng_type_el.text if eng_type_el is not None and eng_type_el.text else ""
-                ),
-            ))
+            columns.append(
+                SchemaColumn(
+                    mnemonic=mnemonic_el.text
+                    if mnemonic_el is not None and mnemonic_el.text
+                    else "",
+                    name=name_el.text if name_el is not None and name_el.text else "",
+                    engineering_type=(
+                        eng_type_el.text if eng_type_el is not None and eng_type_el.text else ""
+                    ),
+                )
+            )
 
     rows: list[list[ResolvedElement]] = []
     for row_elem in node.findall("row"):

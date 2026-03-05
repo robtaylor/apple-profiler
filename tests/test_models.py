@@ -61,8 +61,12 @@ class TestCpuSample:
         proc = Process(pid=1, name="test")
         thread = Thread(tid=1, name="main", process=proc)
         s = CpuSample(
-            time_ns=1000, thread=thread, process=proc,
-            core="CPU 0", state="Running", weight=100,
+            time_ns=1000,
+            thread=thread,
+            process=proc,
+            core="CPU 0",
+            state="Running",
+            weight=100,
         )
         assert s.backtrace == []
 
