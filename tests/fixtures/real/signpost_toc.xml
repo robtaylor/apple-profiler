@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+
+<trace-toc>
+    <run number="1">
+        <info>
+            <target>
+                <device uuid="ACEF90FD-9BB0-56E0-9A50-8EE09341798B" model="MacBook Pro" name="Robert’s MacBook Pro" os-version="15.7.3 (24G419)" platform="macOS"/>
+                <all-processes/>
+            </target>
+            <summary>
+                <start-date>2026-03-05T17:52:11.171Z</start-date>
+                <end-date>2026-03-05T17:52:14.760Z</end-date>
+                <duration>3.588782</duration>
+                <end-reason>Time limit reached</end-reason>
+                <instruments-version>26.0 (17C529)</instruments-version>
+                <template-name>Blank</template-name>
+                <recording-mode>Deferred</recording-mode>
+                <time-limit>3 seconds</time-limit>
+            </summary>
+        </info>
+        <processes>
+            <process name="kernel.release.t6041" pid="0" path="/System/Library/Kernels/kernel.release.t6041"/>
+        </processes>
+        <data>
+            <table codes="&quot;0x07,0x00&quot; &quot;0x1f,0x05&quot;" schema="kdebug" target="ALL"/>
+            <table target-pid="ALL" schema="os-signpost-interval" layout-scope="name"/>
+            <table schema="os-signpost-arg" target-pid="ALL"/>
+            <table codes="&quot;0x1f,0x05&quot;" schema="kdebug-strings" target="ALL"/>
+            <table schema="tick" frequency="10"/>
+            <table schema="thread-info"/>
+            <table schema="os-signpost" target-pid="ALL"/>
+            <table schema="dyld-library-load" target-pid="ALL"/>
+            <table schema="process-info"/>
+        </data>
+        <tracks/>
+    </run>
+</trace-toc>
