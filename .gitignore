@@ -5,6 +5,7 @@ dist/
 build/
 .venv/
 *.trace
+!*.trace.zip
 .pytest_cache/
 .ruff_cache/
 uv.lock
