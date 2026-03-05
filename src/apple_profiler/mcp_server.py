@@ -444,5 +444,10 @@ async def profiler_list_tables(params: TracePathInput) -> str:
         return f"Error listing tables: {e}"
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point for the MCP server."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
