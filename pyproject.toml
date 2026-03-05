@@ -3,7 +3,9 @@ name = "apple-profiler"
 version = "0.1.0"
 description = "Python wrapper for xctrace export XML parsing"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "mcp[cli]>=1.26.0",
+]
 
 [build-system]
 requires = ["hatchling"]
