@@ -1,0 +1,21 @@
+{
+  "name": "apple-profiler",
+  "version": "0.1.0",
+  "description": "Xctrace profiling tools for Claude Code — analyze CPU samples, hangs, signposts from Instruments .trace files",
+  "author": {
+    "name": "Robert Taylor"
+  },
+  "repository": "https://github.com/robtaylor/apple-profiler",
+  "keywords": ["xctrace", "instruments", "profiling", "performance", "macos", "ios"],
+  "mcpServers": {
+    "apple-profiler": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "apple-profiler"
+      ]
+    }
+  }
+}
