@@ -42,4 +42,5 @@ testpaths = ["tests"]
 markers = [
     "integration: tests that require xctrace (deselect with '-m \"not integration\"')",
     "mcp_integration: tests that exercise MCP tools via Claude Code CLI",
+    "metal_integration: tests that compile and trace Metal compute programs",
 ]
