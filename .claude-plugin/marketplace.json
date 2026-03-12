@@ -1,7 +1,7 @@
 {
   "name": "apple-profiler",
   "metadata": {
-    "description": "Xctrace profiling tools — analyze CPU samples, hangs, and signposts from Instruments .trace files"
+    "description": "Xctrace profiling tools — analyze CPU samples, hangs, signposts, Metal/GPU traces, and any Instruments table from .trace files"
   },
   "owner": {
     "name": "Robert Taylor",
@@ -11,14 +11,14 @@
     {
       "name": "apple-profiler",
       "source": "./",
-      "description": "Xctrace profiling tools for Claude Code — analyze CPU samples, hangs, signposts from Instruments .trace files",
+      "description": "Xctrace profiling tools for Claude Code — analyze CPU samples, hangs, signposts, Metal/GPU traces, and any Instruments table from .trace files",
       "version": "0.1.0",
       "author": {
         "name": "Robert Taylor"
       },
       "repository": "https://github.com/robtaylor/apple-profiler",
       "license": "MIT",
-      "keywords": ["xctrace", "instruments", "profiling", "performance", "macos", "ios"]
+      "keywords": ["xctrace", "instruments", "profiling", "performance", "macos", "ios", "metal", "gpu"]
     }
   ]
 }
