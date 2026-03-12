@@ -158,6 +158,7 @@ def _ask_claude(prompt: str, *, max_budget: float = 0.25, model: str = "haiku") 
             "mcp__apple-profiler__profiler_hangs",
             "mcp__apple-profiler__profiler_signpost_events",
             "mcp__apple-profiler__profiler_signpost_intervals",
+            "mcp__apple-profiler__profiler_query_table",
             "mcp__apple-profiler__profiler_list_tables",
             "--disallowedTools",
             "Bash",

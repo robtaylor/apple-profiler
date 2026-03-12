@@ -163,6 +163,27 @@ class SignpostFilterInput(BaseModel):
     )
 
 
+class TableQueryInput(BaseModel):
+    """Input for querying any table by schema name."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+    trace_path: str = Field(..., description="Path to the .trace file", min_length=1)
+    schema: str = Field(
+        ...,
+        description=(
+            "The table schema name to query (e.g., 'metal-gpu-intervals', "
+            "'metal-driver-intervals', 'metal-application-command-buffer-submissions'). "
+            "Use profiler_list_tables to discover available schemas."
+        ),
+        min_length=1,
+    )
+    limit: int | None = Field(
+        default=None,
+        description="Maximum number of rows to return. None returns all.",
+        ge=1,
+    )
+
+
 # ── Tools ──
 
 
@@ -409,6 +430,74 @@ async def profiler_signpost_intervals(params: SignpostFilterInput) -> str:
         )
     except Exception as e:
         return f"Error reading signpost intervals: {e}"
+
+
+@mcp.tool(
+    name="profiler_query_table",
+    annotations=ToolAnnotations(
+        title="Query Any Table by Schema",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def profiler_query_table(params: TableQueryInput) -> str:
+    """Query any data table by schema name, returning rows as JSON.
+
+    This is a generic tool for accessing any table in the trace, including
+    Metal GPU tables (metal-gpu-intervals, metal-driver-intervals,
+    metal-application-command-buffer-submissions, etc.), thermal data,
+    or any other instrument data.
+
+    Use profiler_list_tables first to discover available schemas.
+    Each row is returned as a dict mapping column mnemonics to values.
+
+    Returns:
+        JSON with schema info, column definitions, and row data.
+    """
+    try:
+        t = _get_trace(params.trace_path)
+        if not t.has_table(params.schema):
+            available = [tb.schema for tb in t.tables()]
+            return json.dumps(
+                {
+                    "error": f"Table '{params.schema}' not found in trace.",
+                    "available_schemas": available,
+                },
+                indent=2,
+            )
+        table = t._load_table(params.schema)
+        col_index = {col.mnemonic: i for i, col in enumerate(table.columns)}
+
+        rows = table.rows
+        total_rows = len(rows)
+        if params.limit is not None:
+            rows = rows[: params.limit]
+
+        def _serialize_row(row: list) -> dict[str, str]:
+            result: dict[str, str] = {}
+            for mnemonic, idx in col_index.items():
+                if idx < len(row):
+                    elem = row[idx]
+                    result[mnemonic] = elem.value
+            return result
+
+        return json.dumps(
+            {
+                "schema": params.schema,
+                "columns": [
+                    {"mnemonic": col.mnemonic, "name": col.name, "type": col.engineering_type}
+                    for col in table.columns
+                ],
+                "total_rows": total_rows,
+                "returned": len(rows),
+                "rows": [_serialize_row(r) for r in rows],
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return f"Error querying table '{params.schema}': {e}"
 
 
 @mcp.tool(
