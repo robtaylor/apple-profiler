@@ -12,7 +12,7 @@
       "name": "apple-profiler",
       "source": "./",
       "description": "Xctrace profiling tools for Claude Code — analyze CPU samples, hangs, signposts, Metal/GPU traces, and any Instruments table from .trace files",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "author": {
         "name": "Robert Taylor"
       },
