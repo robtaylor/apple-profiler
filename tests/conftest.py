@@ -31,6 +31,16 @@ def potential_hangs_xml() -> str:
 
 
 @pytest.fixture
+def toc_time_profile_xml() -> str:
+    return (FIXTURES_DIR / "toc_time_profile.xml").read_text()
+
+
+@pytest.fixture
+def time_profile_xml() -> str:
+    return (FIXTURES_DIR / "time_profile.xml").read_text()
+
+
+@pytest.fixture
 def os_signpost_xml() -> str:
     return (FIXTURES_DIR / "os_signpost.xml").read_text()
 

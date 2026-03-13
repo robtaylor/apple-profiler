@@ -20,6 +20,12 @@ from apple_profiler._models import (
 from apple_profiler._parser import ParsedTable, ResolvedElement, parse_table_xml, parse_toc_xml
 from apple_profiler._xctrace import export_table, export_toc
 
+# Schemas that contain CPU sample data with compatible columns
+# (time, thread, process, core, thread-state, weight, stack).
+# "cpu-profile" is used by CPU Profiler template; "time-profile" is used by
+# Time Profiler and Metal System Trace templates — same column schema.
+CPU_SAMPLE_SCHEMAS = ("cpu-profile", "time-profile")
+
 
 class TraceFile:
     """High-level interface to an xctrace .trace file.
@@ -119,6 +125,18 @@ class TraceFile:
         """Check if a table with the given schema exists."""
         return any(t.schema == schema for t in self.tables())
 
+    def _find_cpu_table(self) -> str | None:
+        """Find the first available CPU sample schema, or None."""
+        available = {t.schema for t in self.tables()}
+        for schema in CPU_SAMPLE_SCHEMAS:
+            if schema in available:
+                return schema
+        return None
+
+    def has_cpu_samples(self) -> bool:
+        """Check if the trace contains any CPU sample data."""
+        return self._find_cpu_table() is not None
+
     def _load_table(self, schema: str) -> ParsedTable:
         """Load and cache a table by schema name."""
         if schema not in self._table_cache:
@@ -132,14 +150,34 @@ class TraceFile:
 
     # ── CPU Profiling ──
 
-    def cpu_samples(self) -> list[CpuSample]:
-        """All CPU profile samples."""
-        table = self._load_table("cpu-profile")
+    def cpu_samples(
+        self,
+        *,
+        start_ns: int | None = None,
+        end_ns: int | None = None,
+    ) -> list[CpuSample]:
+        """CPU profile samples, optionally filtered to a time range.
+
+        Args:
+            start_ns: Include only samples at or after this timestamp (nanoseconds).
+            end_ns: Include only samples at or before this timestamp (nanoseconds).
+        """
+        schema = self._find_cpu_table()
+        assert schema is not None, (
+            "No CPU sample table found. Available schemas: "
+            + ", ".join(t.schema for t in self.tables())
+        )
+        table = self._load_table(schema)
         col_index = _column_index(table)
         samples: list[CpuSample] = []
 
         for row in table.rows:
             time_elem = _get_col(row, col_index, "time")
+            time_ns = time_elem.int_value if time_elem else 0
+            if start_ns is not None and time_ns < start_ns:
+                continue
+            if end_ns is not None and time_ns > end_ns:
+                continue
             thread_elem = _get_col(row, col_index, "thread")
             process_elem = _get_col(row, col_index, "process")
             core_elem = _get_col(row, col_index, "core")
@@ -157,7 +195,7 @@ class TraceFile:
 
             samples.append(
                 CpuSample(
-                    time_ns=time_elem.int_value if time_elem else 0,
+                    time_ns=time_ns,
                     thread=thread,
                     process=process,
                     core=core_elem.value if core_elem else "",
@@ -169,10 +207,16 @@ class TraceFile:
 
         return samples
 
-    def top_functions(self, n: int = 20) -> list[tuple[str, int]]:
-        """Top N functions by total cycle weight."""
+    def top_functions(
+        self,
+        n: int = 20,
+        *,
+        start_ns: int | None = None,
+        end_ns: int | None = None,
+    ) -> list[tuple[str, int]]:
+        """Top N functions by total cycle weight, optionally in a time range."""
         counter: Counter[str] = Counter()
-        for sample in self.cpu_samples():
+        for sample in self.cpu_samples(start_ns=start_ns, end_ns=end_ns):
             if sample.backtrace:
                 for frame in sample.backtrace:
                     counter[frame.name] += sample.weight
@@ -336,7 +380,7 @@ class TraceFile:
 
     def threads(self) -> list[Thread]:
         """All unique threads seen across CPU samples (if available)."""
-        if not self.has_table("cpu-profile"):
+        if not self.has_cpu_samples():
             return []
         seen: set[int] = set()
         result: list[Thread] = []

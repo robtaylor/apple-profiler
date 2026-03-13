@@ -127,6 +127,14 @@ class CpuSamplesInput(BaseModel):
         description="Maximum number of samples to return. None returns all.",
         ge=1,
     )
+    start_time_ns: int | None = Field(
+        default=None,
+        description="Include only samples at or after this timestamp (nanoseconds).",
+    )
+    end_time_ns: int | None = Field(
+        default=None,
+        description="Include only samples at or before this timestamp (nanoseconds).",
+    )
 
 
 class TopFunctionsInput(BaseModel):
@@ -139,6 +147,14 @@ class TopFunctionsInput(BaseModel):
         description="Number of top functions to return",
         ge=1,
         le=500,
+    )
+    start_time_ns: int | None = Field(
+        default=None,
+        description="Include only samples at or after this timestamp (nanoseconds).",
+    )
+    end_time_ns: int | None = Field(
+        default=None,
+        description="Include only samples at or before this timestamp (nanoseconds).",
     )
 
 
@@ -240,7 +256,7 @@ async def profiler_open_trace(params: TracePathInput) -> str:
 @mcp.tool(
     name="profiler_cpu_samples",
     annotations=ToolAnnotations(
-        title="Get CPU Profile Samples",
+        title="Get CPU Samples with Stack Traces",
         readOnlyHint=True,
         destructiveHint=False,
         idempotentHint=True,
@@ -248,24 +264,31 @@ async def profiler_open_trace(params: TracePathInput) -> str:
     ),
 )
 async def profiler_cpu_samples(params: CpuSamplesInput) -> str:
-    """Get CPU profile samples from a trace.
+    """Get CPU profile samples, each with a full stack trace (backtrace).
 
     Each sample includes timestamp, thread, process, CPU core, thread state,
     cycle weight, and full backtrace with symbol names and binary info.
+    Works with traces from CPU Profiler, Time Profiler, and Metal System Trace.
+    Optionally filter to a time range using start_time_ns / end_time_ns.
 
     Returns:
         JSON array of CPU samples with backtraces.
     """
     try:
         t = _get_trace(params.trace_path)
-        if not t.has_table("cpu-profile"):
+        if not t.has_cpu_samples():
             return "Error: This trace does not contain CPU profile data."
-        samples = t.cpu_samples()
+        all_samples = t.cpu_samples(
+            start_ns=params.start_time_ns,
+            end_ns=params.end_time_ns,
+        )
+        total = len(all_samples)
+        samples = all_samples
         if params.limit is not None:
             samples = samples[: params.limit]
         return json.dumps(
             {
-                "total_samples": len(t.cpu_samples()),
+                "total_samples": total,
                 "returned": len(samples),
                 "samples": [_sample_dict(s) for s in samples],
             },
@@ -290,15 +313,21 @@ async def profiler_top_functions(params: TopFunctionsInput) -> str:
 
     Aggregates cycle weights across all samples for each function symbol,
     returning the heaviest functions first. Useful for identifying CPU hotspots.
+    Works with traces from CPU Profiler, Time Profiler, and Metal System Trace.
+    Optionally scope to a time range using start_time_ns / end_time_ns.
 
     Returns:
         JSON array of {function, total_weight} sorted by weight descending.
     """
     try:
         t = _get_trace(params.trace_path)
-        if not t.has_table("cpu-profile"):
+        if not t.has_cpu_samples():
             return "Error: This trace does not contain CPU profile data."
-        top = t.top_functions(params.n)
+        top = t.top_functions(
+            params.n,
+            start_ns=params.start_time_ns,
+            end_ns=params.end_time_ns,
+        )
         return json.dumps(
             {
                 "top_functions": [

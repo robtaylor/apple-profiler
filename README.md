@@ -19,8 +19,8 @@ claude plugin add apple-profiler
 | Tool | Description |
 |------|-------------|
 | `profiler_open_trace` | Open a `.trace` file, return device info, duration, and available tables |
-| `profiler_cpu_samples` | Get CPU profile samples with backtraces and cycle weights |
-| `profiler_top_functions` | Top N functions by total CPU cycle weight |
+| `profiler_cpu_samples` | Get CPU samples with full stack traces (backtraces), optional time-range filtering |
+| `profiler_top_functions` | Top N functions by CPU weight, optional time-range filtering |
 | `profiler_hangs` | Detected hang/unresponsiveness intervals |
 | `profiler_signpost_events` | Raw `os-signpost` Begin/End/Event entries with optional filtering |
 | `profiler_signpost_intervals` | Matched signpost intervals (begin+end pairs) with durations |
@@ -31,10 +31,24 @@ claude plugin add apple-profiler
 
 ### CPU Profiling
 
+Works with CPU Profiler, Time Profiler, and Metal System Trace templates.
+
 ```
 1. profiler_open_trace(trace_path="recording.trace")
 2. profiler_top_functions(trace_path="recording.trace", n=10)
 3. profiler_cpu_samples(trace_path="recording.trace", limit=50)
+```
+
+### Time-Range Scoped Analysis
+
+```
+# What was hot between 1.0s and 1.5s?
+profiler_top_functions(trace_path="recording.trace", n=10,
+    start_time_ns=1000000000, end_time_ns=1500000000)
+
+# Stack traces in that window
+profiler_cpu_samples(trace_path="recording.trace",
+    start_time_ns=1000000000, end_time_ns=1500000000, limit=20)
 ```
 
 ### Hang Detection

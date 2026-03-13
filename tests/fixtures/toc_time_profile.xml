@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<trace-toc>
+    <run number="1">
+        <info>
+            <target>
+                <device uuid="ACEF90FD-9BB0-56E0-9A50-8EE09341798B" model="MacBook Pro" name="Robert's MacBook Pro" os-version="15.7.3 (24G419)" platform="macOS"/>
+                <process type="launched" return-exit-status="0" name="lu_bench" pid="18394" termination-reason="exit(0)"/>
+            </target>
+            <summary>
+                <start-date>2026-03-13T01:20:22.975Z</start-date>
+                <end-date>2026-03-13T01:20:24.219Z</end-date>
+                <duration>1.243588</duration>
+                <end-reason>Target app exited</end-reason>
+                <instruments-version>26.0 (17C529)</instruments-version>
+                <template-name>Metal System Trace</template-name>
+                <recording-mode>Deferred</recording-mode>
+                <time-limit>12 hours</time-limit>
+            </summary>
+        </info>
+        <processes>
+            <process name="lu_bench" pid="18394" path="build_metal/baspacho/benchmarking/lu_bench"/>
+            <process name="kernel.release.t6041" pid="0" path="/System/Library/Kernels/kernel.release.t6041"/>
+        </processes>
+        <data>
+            <table target-pid="SINGLE" schema="time-profile" record-waiting-threads="0" needs-kernel-callstack="0"/>
+            <table schema="metal-gpu-intervals" target-pid="SINGLE"/>
+            <table schema="metal-driver-intervals" target-pid="SINGLE"/>
+            <table schema="process-info"/>
+        </data>
+        <tracks/>
+    </run>
+</trace-toc>

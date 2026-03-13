@@ -262,6 +262,94 @@ class TestProcesses:
         assert "kernel.release.t6041" in names
 
 
+class TestTimeProfileSchema:
+    """Test that time-profile schema (from Time Profiler / Metal System Trace) works."""
+
+    @pytest.fixture
+    def time_profile_trace(
+        self, toc_time_profile_xml: str, time_profile_xml: str
+    ) -> TraceFile:
+        table_map = {"time-profile": time_profile_xml}
+
+        def loader(schema: str, kwargs: dict[str, str]) -> str:
+            xml = table_map.get(schema)
+            if xml is None:
+                raise ValueError(f"No fixture for schema: {schema}")
+            return xml
+
+        return TraceFile.from_xml(toc_time_profile_xml, table_loader=loader)
+
+    def test_has_cpu_samples(self, time_profile_trace: TraceFile) -> None:
+        assert time_profile_trace.has_cpu_samples()
+
+    def test_no_cpu_profile_table(self, time_profile_trace: TraceFile) -> None:
+        assert not time_profile_trace.has_table("cpu-profile")
+        assert time_profile_trace.has_table("time-profile")
+
+    def test_cpu_samples_returns_data(self, time_profile_trace: TraceFile) -> None:
+        samples = time_profile_trace.cpu_samples()
+        assert len(samples) == 3
+
+    def test_backtrace_from_time_profile(self, time_profile_trace: TraceFile) -> None:
+        sample = time_profile_trace.cpu_samples()[0]
+        assert len(sample.backtrace) == 3
+        assert sample.backtrace[0].name == "CF_IS_OBJC"
+
+    def test_top_functions_from_time_profile(self, time_profile_trace: TraceFile) -> None:
+        top = time_profile_trace.top_functions(n=5)
+        assert len(top) > 0
+        names = [name for name, _ in top]
+        assert "CF_IS_OBJC" in names
+
+    def test_threads_from_time_profile(self, time_profile_trace: TraceFile) -> None:
+        threads = time_profile_trace.threads()
+        assert len(threads) > 0
+
+    def test_template_is_metal_system_trace(self, time_profile_trace: TraceFile) -> None:
+        assert time_profile_trace.info.template_name == "Metal System Trace"
+
+
+class TestTimeRangeFiltering:
+    """Test time-range filtering on cpu_samples() and top_functions()."""
+
+    def test_filter_start_ns(self, trace_file: TraceFile) -> None:
+        # Samples at 575214000, 576214000, 577214000
+        samples = trace_file.cpu_samples(start_ns=576214000)
+        assert len(samples) == 2
+        assert all(s.time_ns >= 576214000 for s in samples)
+
+    def test_filter_end_ns(self, trace_file: TraceFile) -> None:
+        samples = trace_file.cpu_samples(end_ns=576214000)
+        assert len(samples) == 2
+        assert all(s.time_ns <= 576214000 for s in samples)
+
+    def test_filter_both(self, trace_file: TraceFile) -> None:
+        samples = trace_file.cpu_samples(start_ns=576214000, end_ns=576214000)
+        assert len(samples) == 1
+        assert samples[0].time_ns == 576214000
+
+    def test_filter_no_match(self, trace_file: TraceFile) -> None:
+        samples = trace_file.cpu_samples(start_ns=999999999)
+        assert len(samples) == 0
+
+    def test_filter_none_returns_all(self, trace_file: TraceFile) -> None:
+        samples = trace_file.cpu_samples()
+        assert len(samples) == 3
+
+    def test_top_functions_with_range(self, trace_file: TraceFile) -> None:
+        # Only first sample (575214000) has weight 837200
+        top = trace_file.top_functions(n=10, start_ns=575214000, end_ns=575214000)
+        assert len(top) > 0
+        # CF_IS_OBJC is in the first sample's backtrace
+        func_dict = dict(top)
+        assert "CF_IS_OBJC" in func_dict
+        assert func_dict["CF_IS_OBJC"] == 837200
+
+    def test_top_functions_empty_range(self, trace_file: TraceFile) -> None:
+        top = trace_file.top_functions(n=10, start_ns=999999999)
+        assert len(top) == 0
+
+
 class TestIntegration:
     """Integration test requiring actual xctrace binary."""
 
@@ -279,7 +367,7 @@ class TestIntegration:
         tables = t.tables()
         assert len(tables) > 0
 
-        if t.has_table("cpu-profile"):
+        if t.has_cpu_samples():
             samples = t.cpu_samples()
             assert len(samples) > 0
             assert samples[0].backtrace  # should have frames
