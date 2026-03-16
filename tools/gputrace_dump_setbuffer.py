@@ -12,12 +12,12 @@ modes for buffer bindings. This is needed to determine if we can build
 accurate (non-conservative) dependency graphs.
 
 Usage:
-    DYLD_FRAMEWORK_PATH="/Applications/Xcode.app/Contents/SharedFrameworks" \
-        uv run tools/gputrace_dump_setbuffer.py /path/to/capture.gputrace
+    uv run tools/gputrace_dump_setbuffer.py /path/to/capture.gputrace
 """
 from __future__ import annotations
 
 import ctypes
+import os
 import re
 import struct
 import sys
@@ -34,6 +34,13 @@ _FRAMEWORK_NAMES = [
     "GPUToolsCore", "GPUTools", "GPUToolsPlatform",
     "GLToolsCore", "GPUToolsServices",
 ]
+
+
+def _ensure_dyld_framework_path() -> None:
+    """Re-exec with DYLD_FRAMEWORK_PATH if not set."""
+    if os.environ.get("DYLD_FRAMEWORK_PATH") != SHARED_FW:
+        os.environ["DYLD_FRAMEWORK_PATH"] = SHARED_FW
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def _load_frameworks() -> None:
@@ -76,6 +83,7 @@ def hexdump(data: bytes, width: int = 16) -> str:
 
 
 def main() -> None:
+    _ensure_dyld_framework_path()
     path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/baspacho_ffi.gputrace"
 
     url = NSURL.fileURLWithPath_(path)

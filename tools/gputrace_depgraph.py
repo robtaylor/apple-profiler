@@ -21,8 +21,7 @@ Output formats:
   - JSON: machine-readable nodes, edges, and summary
 
 Usage:
-    DYLD_FRAMEWORK_PATH="/Applications/Xcode.app/Contents/SharedFrameworks" \\
-        uv run tools/gputrace_depgraph.py /path/to/capture.gputrace
+    uv run tools/gputrace_depgraph.py /path/to/capture.gputrace
 
     # JSON only
     ... gputrace_depgraph.py trace.gputrace -f json -o deps.json
@@ -38,11 +37,27 @@ Usage:
 """
 from __future__ import annotations
 
+import os
+import sys
+
+_SHARED_FW = "/Applications/Xcode.app/Contents/SharedFrameworks"
+
+
+def _ensure_dyld_framework_path() -> None:
+    """Re-exec with DYLD_FRAMEWORK_PATH if not set.
+
+    dyld reads this variable at process startup to resolve @rpath references,
+    so it must be set before any GPU framework is loaded. When missing, we
+    set it and os.execv() to restart the process.
+    """
+    if os.environ.get("DYLD_FRAMEWORK_PATH") != _SHARED_FW:
+        os.environ["DYLD_FRAMEWORK_PATH"] = _SHARED_FW
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
 import argparse
 import fnmatch
 import json
 import logging
-import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -679,6 +694,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    _ensure_dyld_framework_path()
     args = parse_args()
 
     # Import and run the timeline reader

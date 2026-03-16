@@ -13,9 +13,10 @@ what threadgroup sizes, and which buffers are bound.
 
 Requirements:
   - macOS with Xcode installed (uses private frameworks from Xcode.app)
-  - Must set DYLD_FRAMEWORK_PATH for @rpath resolution:
-      DYLD_FRAMEWORK_PATH="/Applications/Xcode.app/Contents/SharedFrameworks" \\
-          uv run tools/gputrace_timeline.py /path/to/capture.gputrace
+  - DYLD_FRAMEWORK_PATH is set automatically via re-exec if needed
+
+Usage:
+    uv run tools/gputrace_timeline.py /path/to/capture.gputrace
 
 The function index → Metal API mapping was reverse-engineered from a compute-only
 baspacho sparse linear algebra workload. Indices may change across Xcode versions.
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import re
 import struct
 import sys
@@ -53,6 +55,18 @@ _FRAMEWORK_NAMES = [
     "GLToolsCore",
     "GPUToolsServices",
 ]
+
+
+def _ensure_dyld_framework_path() -> None:
+    """Re-exec with DYLD_FRAMEWORK_PATH if not set.
+
+    dyld reads this variable at process startup to resolve @rpath references,
+    so it must be set before any GPU framework is loaded. When missing, we
+    set it and os.execv() to restart the process.
+    """
+    if os.environ.get("DYLD_FRAMEWORK_PATH") != SHARED_FW:
+        os.environ["DYLD_FRAMEWORK_PATH"] = SHARED_FW
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def _load_frameworks() -> None:
@@ -352,6 +366,7 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
 
 
 def main() -> None:
+    _ensure_dyld_framework_path()
     path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/baspacho_ffi.gputrace"
     result = read_gputrace(path)
 
