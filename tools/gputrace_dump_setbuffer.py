@@ -63,11 +63,13 @@ DYFunctionTracer = objc.lookUpClass("DYFunctionTracer")
 SET_BUFFER_IDX = -16336  # setBuffer:offset:atIndex:
 
 # Also dump these related calls for comparison
+# (Corrected indices from rosetta stone verification 2026-03-17)
 RELATED_INDICES = {
     -16337: "setBytes:length:atIndex:",
     -16338: "setComputePipelineState:",
     -16327: "dispatchThreadgroups:threadsPerThreadgroup:",
-    -16009: "dispatchThreads:threadsPerThreadgroup:",
+    -16078: "dispatchThreads:threadsPerThreadgroup: (non-uniform)",
+    -16009: "memoryBarrierWithScope: (NOT a dispatch!)",
 }
 
 

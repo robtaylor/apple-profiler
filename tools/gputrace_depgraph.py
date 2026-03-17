@@ -150,6 +150,11 @@ def extract_dispatches(
     """Convert timeline events into DispatchNode list.
 
     Returns (nodes, num_command_buffers, num_encoders).
+
+    Note: Memory barrier events ("type": "barrier") are intentionally filtered out
+    here. Barriers are synchronization points but do not consume GPU compute resources.
+    In a future version, barriers may be represented as separate BarrierNode objects
+    in the dependency graph to model their synchronization semantics.
     """
     nodes: list[DispatchNode] = []
     dispatch_id = 0
