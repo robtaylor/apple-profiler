@@ -216,7 +216,7 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
             break
 
         ptr_addr = func_ptr.pointerAsInteger
-        raw_header = ctypes.string_at(ptr_addr, 8)
+        raw_header = ctypes.string_at(ptr_addr, 24)
         idx = struct.unpack_from("<i", raw_header, 0)[0]
 
         if idx not in FUNC_NAMES:
@@ -261,9 +261,12 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
         # ---- Command buffer lifecycle ----
 
         elif idx == -16352:  # MTLCommandQueue.commandBuffer
+            # NOTE: -16352 fires per-encoder too, not just per-CB.
+            # Use the return value address to detect new CBs vs re-fires.
             if trace and "=" in trace:
                 ret_str = trace.split("=")[0].strip()
-                if ret_str.startswith("0x"):
+                if ret_str.startswith("0x") and ret_str != current_cb_addr:
+                    # New command buffer (different return address)
                     current_cb_addr = ret_str
                     current_cb_dispatches = []
                     current_cb_idx = len(command_buffers)
@@ -309,6 +312,19 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                 enc_ret = trace.split("=")[0].strip()
                 if enc_ret.startswith("0x"):
                     current_encoder_addr = enc_ret
+            # The receiver (offset 16) of computeCommandEncoder() is the
+            # MTLCommandBuffer — use it as the authoritative CB address.
+            receiver = struct.unpack_from("<Q", raw_header, 16)[0]
+            if receiver:
+                cb_addr = f"0x{receiver:x}"
+                if cb_addr != current_cb_addr:
+                    # CB address changed — this is a new command buffer that
+                    # wasn't announced by a -16352 call.
+                    current_cb_addr = cb_addr
+                    current_cb_dispatches = []
+                    current_cb_idx = len(command_buffers)
+                elif not current_cb_addr:
+                    current_cb_addr = cb_addr
             # Don't reset pipeline — it carries over because encoder creation
             # isn't always explicit in the unsorted-capture stream.
             buffers_bound = {}
