@@ -22,6 +22,7 @@ from gputrace_depgraph import (  # noqa: I001
     DependencyEdge,
     DependencyGraph,
     DispatchNode,
+    TraceMetadata,
     build_cb_graph,
     build_dependency_graph,
     build_encoder_graph,
@@ -376,11 +377,11 @@ class TestExtractDispatches:
             ],
         }
 
-        nodes, barriers, num_cbs, num_encoders = extract_dispatches(trace_data)
+        nodes, barriers, meta = extract_dispatches(trace_data)
         assert len(nodes) == 2
         assert len(barriers) == 0
-        assert num_cbs == 1
-        assert num_encoders == 2
+        assert meta.num_cbs == 1
+        assert meta.num_encoders == 2
         assert nodes[0].kernel == "k1"
         assert nodes[0].command_buffer_idx == 0
         assert nodes[0].encoder_idx == 0
@@ -392,13 +393,13 @@ class TestExtractDispatches:
         assert len(nodes[1].buffers) == 1
 
     def test_empty_trace(self):
-        nodes, barriers, num_cbs, num_encoders = extract_dispatches(
+        nodes, barriers, meta = extract_dispatches(
             {"events": [], "command_buffers": [], "compute_encoders": []}
         )
         assert len(nodes) == 0
         assert len(barriers) == 0
-        assert num_cbs == 0
-        assert num_encoders == 0
+        assert meta.num_cbs == 0
+        assert meta.num_encoders == 0
 
 
 # ---------------------------------------------------------------------------
@@ -672,7 +673,7 @@ class TestBarrierExtraction:
             ],
         }
 
-        nodes, barriers, num_cbs, num_encoders = extract_dispatches(trace_data)
+        nodes, barriers, meta = extract_dispatches(trace_data)
         assert len(nodes) == 2
         assert len(barriers) == 1
         assert barriers[0].scope == "buffers"
@@ -704,7 +705,7 @@ class TestBarrierExtraction:
             ],
         }
 
-        nodes, barriers, _, _ = extract_dispatches(trace_data)
+        nodes, barriers, _meta = extract_dispatches(trace_data)
         assert len(barriers) == 1
         assert barriers[0].after_dispatch_id == -1
 
@@ -726,7 +727,7 @@ class TestBarrierExtraction:
             ],
         }
 
-        nodes, barriers, _, _ = extract_dispatches(trace_data)
+        nodes, barriers, _meta = extract_dispatches(trace_data)
         assert len(barriers) == 2
         assert barriers[0].after_dispatch_id == 0
         assert barriers[0].scope == "buffers"

@@ -205,7 +205,9 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
     current_encoder_dispatches: list[dict[str, Any]] = []
     encoder_counter: int = 0
     current_encoder_idx: int = -1
+    current_encoder_addr: str = ""
     current_cb_idx: int = -1
+    current_cb_addr: str = ""
 
     func_idx = 0
     while True:
@@ -262,6 +264,7 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
             if trace and "=" in trace:
                 ret_str = trace.split("=")[0].strip()
                 if ret_str.startswith("0x"):
+                    current_cb_addr = ret_str
                     current_cb_dispatches = []
                     current_cb_idx = len(command_buffers)
 
@@ -271,16 +274,20 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                 compute_encoders.append({
                     "encoder_idx": current_encoder_idx,
                     "command_buffer_idx": current_cb_idx,
+                    "addr": current_encoder_addr,
                     "dispatches": list(current_encoder_dispatches),
                 })
                 current_encoder_dispatches = []
                 current_encoder_idx = -1
+                current_encoder_addr = ""
             if current_cb_dispatches:
                 command_buffers.append({
                     "func_idx": func_idx,
+                    "addr": current_cb_addr,
                     "dispatches": list(current_cb_dispatches),
                 })
             current_cb_dispatches = []
+            current_cb_addr = ""
 
         # ---- Encoder lifecycle ----
 
@@ -290,11 +297,18 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                 compute_encoders.append({
                     "encoder_idx": current_encoder_idx,
                     "command_buffer_idx": current_cb_idx,
+                    "addr": current_encoder_addr,
                     "dispatches": list(current_encoder_dispatches),
                 })
                 current_encoder_dispatches = []
             current_encoder_idx = encoder_counter
             encoder_counter += 1
+            # Capture encoder address from trace return value
+            current_encoder_addr = ""
+            if trace and "=" in trace:
+                enc_ret = trace.split("=")[0].strip()
+                if enc_ret.startswith("0x"):
+                    current_encoder_addr = enc_ret
             # Don't reset pipeline — it carries over because encoder creation
             # isn't always explicit in the unsorted-capture stream.
             buffers_bound = {}
@@ -304,10 +318,12 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                 compute_encoders.append({
                     "encoder_idx": current_encoder_idx,
                     "command_buffer_idx": current_cb_idx,
+                    "addr": current_encoder_addr,
                     "dispatches": list(current_encoder_dispatches),
                 })
                 current_encoder_dispatches = []
                 current_encoder_idx = -1
+                current_encoder_addr = ""
 
         # ---- Pipeline state setting ----
 

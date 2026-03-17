@@ -163,12 +163,21 @@ def _import_read_gputrace():
     return read_gputrace
 
 
+@dataclass
+class TraceMetadata:
+    """Metadata extracted alongside dispatch/barrier nodes."""
+    num_cbs: int
+    num_encoders: int
+    cb_addrs: dict[int, str] = field(default_factory=dict)   # cb_idx → hex addr
+    enc_addrs: dict[int, str] = field(default_factory=dict)  # enc_idx → hex addr
+
+
 def extract_dispatches(
     trace_data: dict[str, Any],
-) -> tuple[list[DispatchNode], list[BarrierNode], int, int]:
+) -> tuple[list[DispatchNode], list[BarrierNode], TraceMetadata]:
     """Convert timeline events into DispatchNode and BarrierNode lists.
 
-    Returns (dispatch_nodes, barrier_nodes, num_command_buffers, num_encoders).
+    Returns (dispatch_nodes, barrier_nodes, trace_metadata).
 
     Barriers are synchronization points: all dispatches before a barrier in the
     same encoder must complete before any dispatch after the barrier can start.
@@ -178,11 +187,22 @@ def extract_dispatches(
     dispatch_id = 0
     barrier_id = 0
 
-    # Build a dispatch_func_idx → command_buffer_idx mapping
+    # Build a dispatch_func_idx → command_buffer_idx mapping, collect addresses
     cb_map: dict[int, int] = {}
+    cb_addrs: dict[int, str] = {}
     for cb_idx, cb in enumerate(trace_data.get("command_buffers", [])):
         for d in cb.get("dispatches", []):
             cb_map[d["index"]] = cb_idx
+        addr = cb.get("addr", "")
+        if addr:
+            cb_addrs[cb_idx] = addr
+
+    # Collect encoder addresses
+    enc_addrs: dict[int, str] = {}
+    for enc in trace_data.get("compute_encoders", []):
+        addr = enc.get("addr", "")
+        if addr:
+            enc_addrs[enc["encoder_idx"]] = addr
 
     # Track the last dispatch_id per encoder (for barrier placement)
     last_dispatch_in_encoder: dict[int, int] = {}
@@ -227,9 +247,13 @@ def extract_dispatches(
             ))
             barrier_id += 1
 
-    num_cbs = len(trace_data.get("command_buffers", []))
-    num_encoders = len(trace_data.get("compute_encoders", []))
-    return nodes, barriers, num_cbs, num_encoders
+    meta = TraceMetadata(
+        num_cbs=len(trace_data.get("command_buffers", [])),
+        num_encoders=len(trace_data.get("compute_encoders", [])),
+        cb_addrs=cb_addrs,
+        enc_addrs=enc_addrs,
+    )
+    return nodes, barriers, meta
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +725,7 @@ def build_cb_graph(
     nodes: list[DispatchNode],
     graph: DependencyGraph,
     barriers: list[BarrierNode] | None = None,
+    cb_addrs: dict[int, str] | None = None,
 ) -> AggregatedGraph:
     """Collapse dependency graph to command buffer level.
 
@@ -708,6 +733,7 @@ def build_cb_graph(
     shares a buffer dependency with a dispatch in the other.
     """
     node_map = {n.dispatch_id: n for n in nodes}
+    _cb_addrs = cb_addrs or {}
 
     # Count barriers per CB
     cb_barrier_count: dict[int, int] = defaultdict(int)
@@ -737,7 +763,8 @@ def build_cb_graph(
         )
         node = agg_nodes[nid]
         b_str = f", {b_count} barriers" if b_count else ""
-        node.label = f"CB #{cb_idx}\\n{node.dispatch_count} dispatches{b_str}\\n{node.short_composition}"
+        addr_str = f" ({_cb_addrs[cb_idx]})" if cb_idx in _cb_addrs else ""
+        node.label = f"CB #{cb_idx}{addr_str}\\n{node.dispatch_count} dispatches{b_str}\\n{node.short_composition}"
 
     # Build aggregated edges
     agg_edges: dict[tuple[str, str], AggregatedEdge] = {}
@@ -765,12 +792,16 @@ def build_encoder_graph(
     nodes: list[DispatchNode],
     graph: DependencyGraph,
     barriers: list[BarrierNode] | None = None,
+    enc_addrs: dict[int, str] | None = None,
+    cb_addrs: dict[int, str] | None = None,
 ) -> AggregatedGraph:
     """Collapse dependency graph to compute encoder level.
 
     One node per encoder. Clustered by command buffer.
     """
     node_map = {n.dispatch_id: n for n in nodes}
+    _enc_addrs = enc_addrs or {}
+    _cb_addrs = cb_addrs or {}
 
     # Count barriers per encoder
     enc_barrier_count: dict[int, int] = defaultdict(int)
@@ -804,7 +835,8 @@ def build_encoder_graph(
         node = agg_nodes[nid]
         comp = node.short_composition
         b_str = f", {b_count} barriers" if b_count else ""
-        node.label = f"Encoder #{enc_idx}\\n{node.dispatch_count} dispatches{b_str}\\n{comp}"
+        addr_str = f" ({_enc_addrs[enc_idx]})" if enc_idx in _enc_addrs else ""
+        node.label = f"Encoder #{enc_idx}{addr_str}\\n{node.dispatch_count} dispatches{b_str}\\n{comp}"
 
     # Build aggregated edges
     agg_edges: dict[tuple[str, str], AggregatedEdge] = {}
@@ -825,7 +857,10 @@ def build_encoder_graph(
     clusters: dict[str, list[str]] = defaultdict(list)
     for nid, cb_idx in enc_to_cb.items():
         if cb_idx >= 0:
-            clusters[f"CB #{cb_idx}"].append(nid)
+            cb_label = f"CB #{cb_idx}"
+            if cb_idx in _cb_addrs:
+                cb_label += f" ({_cb_addrs[cb_idx]})"
+            clusters[cb_label].append(nid)
 
     return AggregatedGraph(
         nodes=list(agg_nodes.values()),
@@ -1850,10 +1885,10 @@ def main() -> None:
         sys.exit(1)
 
     # Extract dispatches and barriers
-    nodes, barriers, num_cbs, num_encoders = extract_dispatches(trace_data)
+    nodes, barriers, meta = extract_dispatches(trace_data)
     log.info(
         "Extracted %d dispatches, %d barriers from %d command buffers, %d encoders",
-        len(nodes), len(barriers), num_cbs, num_encoders,
+        len(nodes), len(barriers), meta.num_cbs, meta.num_encoders,
     )
 
     if not nodes:
@@ -1911,7 +1946,7 @@ def main() -> None:
         log.info("After reduction: %d edges", len(graph.edges))
 
     # Summary
-    print_summary(graph, num_cbs, num_barriers=len(barriers))
+    print_summary(graph, meta.num_cbs, num_barriers=len(barriers))
 
     if args.summary_only:
         return
@@ -1927,10 +1962,13 @@ def main() -> None:
     suffix = _scale_suffix(scale)
 
     if scale == "cb":
-        agg = build_cb_graph(nodes, graph, barriers=barriers)
+        agg = build_cb_graph(nodes, graph, barriers=barriers,
+                             cb_addrs=meta.cb_addrs)
         dot_content = format_aggregated_dot(agg, title="cb_deps")
     elif scale == "encoder":
-        agg = build_encoder_graph(nodes, graph, barriers=barriers)
+        agg = build_encoder_graph(nodes, graph, barriers=barriers,
+                                  enc_addrs=meta.enc_addrs,
+                                  cb_addrs=meta.cb_addrs)
         dot_content = format_aggregated_dot(agg, title="encoder_deps")
     elif scale == "kernel":
         agg = build_kernel_graph(nodes, graph)
