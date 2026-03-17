@@ -1115,7 +1115,6 @@ _HTML_TEMPLATE = """\
 <script src="https://unpkg.com/cytoscape@3/dist/cytoscape.min.js"></script>
 <script src="https://unpkg.com/dagre@0.8/dist/dagre.min.js"></script>
 <script src="https://unpkg.com/cytoscape-dagre@2/cytoscape-dagre.js"></script>
-<script src="https://unpkg.com/cytoscape-fcose@2/cytoscape-fcose.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/cytoscape-tidytree/dist/cytoscape-tidytree.min.js"></script>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -1168,10 +1167,10 @@ _HTML_TEMPLATE = """\
   <button id="search-prev" title="Previous match" style="display:none">&uarr;</button>
   <button id="search-next" title="Next match" style="display:none">&darr;</button>
   <select id="layout-select">
-    <option value="fcose">fCoSE</option>
     <option value="dagre">Dagre (DAG)</option>
     <option value="tidytree">Tidy Tree</option>
     <option value="breadthfirst">Breadthfirst</option>
+    <option value="cose">Force-directed</option>
   </select>
 </div>
 <div id="cy"></div>
@@ -1290,7 +1289,7 @@ const cy = cytoscape({{
       }}
     }},
   ],
-  layout: {{ name: 'fcose', quality: 'proof', animate: false, nodeSeparation: 80, idealEdgeLength: 80, nodeRepulsion: 8000 }},
+  layout: {{ name: 'dagre', rankDir: 'TB', nodeSep: 40, rankSep: 60 }},
   autoungrabify: true,      // nodes locked in place — click-drag pans
   wheelSensitivity: 0.3,
   minZoom: 0.05,
@@ -1386,14 +1385,14 @@ document.getElementById('search-prev').addEventListener('click', () => jumpToMat
 document.getElementById('search-next').addEventListener('click', () => jumpToMatch(searchIdx + 1));
 
 const LAYOUTS = {{
-  fcose: {{ name: 'fcose', quality: 'proof', animate: false, nodeSeparation: 80, idealEdgeLength: 80, nodeRepulsion: 8000 }},
   dagre: {{ name: 'dagre', rankDir: 'TB', nodeSep: 40, rankSep: 60 }},
   tidytree: {{ name: 'tidytree', direction: 'TB', horizontalSpacing: 40, verticalSpacing: 60 }},
   breadthfirst: {{ name: 'breadthfirst', directed: true, spacingFactor: 1.2 }},
+  cose: {{ name: 'cose', idealEdgeLength: 120, nodeRepulsion: 8000, animate: false }},
 }};
 
 document.getElementById('layout-select').addEventListener('change', (e) => {{
-  const opts = LAYOUTS[e.target.value] || LAYOUTS.fcose;
+  const opts = LAYOUTS[e.target.value] || LAYOUTS.dagre;
   cy.layout(opts).run();
 }});
 
