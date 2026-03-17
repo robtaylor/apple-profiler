@@ -19,6 +19,7 @@ or external annotations to classify access modes.
 Output formats:
   - DOT (Graphviz): visual graph with command buffer clusters
   - JSON: machine-readable nodes, edges, and summary
+  - HTML: interactive browser viewer with Cytoscape.js (pan/zoom/click)
 
 Usage:
     uv run tools/gputrace_depgraph.py /path/to/capture.gputrace
@@ -28,6 +29,9 @@ Usage:
 
     # DOT only, no transitive reduction
     ... gputrace_depgraph.py trace.gputrace -f dot --no-reduce
+
+    # Interactive HTML viewer (opens in browser)
+    ... gputrace_depgraph.py trace.gputrace -f html --open
 
     # Summary statistics only
     ... gputrace_depgraph.py trace.gputrace --summary-only
@@ -58,6 +62,7 @@ import argparse
 import fnmatch
 import json
 import logging
+import webbrowser
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1048,6 +1053,469 @@ def format_json(graph: DependencyGraph) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# HTML output (interactive Cytoscape.js viewer)
+# ---------------------------------------------------------------------------
+
+_DEP_EDGE_COLORS = {
+    "RAW": "#e63946",
+    "WAW": "#f4a261",
+    "WAR": "#457b9d",
+    "SHARED": "#6c757d",
+}
+
+_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>GPU Dependency Graph — {title}</title>
+<script src="https://unpkg.com/cytoscape@3/dist/cytoscape.min.js"></script>
+<script src="https://unpkg.com/dagre@0.8/dist/dagre.min.js"></script>
+<script src="https://unpkg.com/cytoscape-dagre@2/cytoscape-dagre.js"></script>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background: #1a1a2e; color: #e0e0e0; }}
+  #cy {{ width: 100vw; height: 100vh; }}
+  #controls {{
+    position: fixed; top: 12px; left: 12px; z-index: 10;
+    display: flex; gap: 8px; align-items: center;
+  }}
+  #controls button, #controls input, #controls select {{
+    padding: 6px 12px; border: 1px solid #444; border-radius: 4px;
+    background: #16213e; color: #e0e0e0; font-size: 13px; cursor: pointer;
+  }}
+  #controls button:hover {{ background: #0f3460; }}
+  #controls input {{ width: 180px; }}
+  #details {{
+    position: fixed; bottom: 0; right: 0; width: 340px; max-height: 50vh;
+    background: #16213e; border-left: 1px solid #444; border-top: 1px solid #444;
+    border-radius: 8px 0 0 0; padding: 14px; overflow-y: auto;
+    font-size: 13px; display: none; z-index: 10;
+  }}
+  #details h3 {{ margin-bottom: 8px; color: #e2b340; }}
+  #details table {{ width: 100%; border-collapse: collapse; }}
+  #details td {{ padding: 3px 6px; border-bottom: 1px solid #333; }}
+  #details td:first-child {{ color: #8ab4f8; white-space: nowrap; }}
+  #legend {{
+    position: fixed; bottom: 12px; left: 12px; z-index: 10;
+    background: #16213e; border: 1px solid #444; border-radius: 6px;
+    padding: 10px 14px; font-size: 12px;
+  }}
+  #legend span {{ margin-right: 14px; }}
+  .edge-dot {{ display: inline-block; width: 10px; height: 10px;
+               border-radius: 50%; margin-right: 4px; vertical-align: middle; }}
+</style>
+</head>
+<body>
+<div id="controls">
+  <button id="fit-btn" title="Fit to screen">Fit</button>
+  <input id="filter-input" type="text" placeholder="Filter by kernel name..." />
+  <select id="layout-select">
+    <option value="dagre">Dagre (DAG)</option>
+    <option value="breadthfirst">Breadthfirst</option>
+    <option value="cose">Force-directed</option>
+  </select>
+</div>
+<div id="cy"></div>
+<div id="details"></div>
+<div id="legend">
+  <span><span class="edge-dot" style="background:#e63946"></span>RAW</span>
+  <span><span class="edge-dot" style="background:#f4a261"></span>WAW</span>
+  <span><span class="edge-dot" style="background:#457b9d"></span>WAR</span>
+  <span><span class="edge-dot" style="background:#6c757d"></span>SHARED</span>
+  <span><span class="edge-dot" style="background:#e63946; border-radius:0"></span>barrier</span>
+</div>
+<script>
+const GRAPH_DATA = {graph_json};
+
+const cy = cytoscape({{
+  container: document.getElementById('cy'),
+  elements: GRAPH_DATA.elements,
+  style: [
+    {{
+      selector: 'node[type="dispatch"]',
+      style: {{
+        'shape': 'roundrectangle',
+        'label': 'data(label)',
+        'text-wrap': 'wrap',
+        'text-valign': 'center',
+        'text-halign': 'center',
+        'font-size': '10px',
+        'width': 'label',
+        'height': 'label',
+        'padding': '10px',
+        'background-color': '#2a4a7f',
+        'color': '#e0e0e0',
+        'border-width': 1,
+        'border-color': '#3a6abf',
+      }}
+    }},
+    {{
+      selector: 'node[type="barrier"]',
+      style: {{
+        'shape': 'diamond',
+        'label': 'data(label)',
+        'width': 30,
+        'height': 30,
+        'font-size': '9px',
+        'text-valign': 'center',
+        'text-halign': 'center',
+        'background-color': '#c0392b',
+        'color': '#fff',
+        'border-width': 1,
+        'border-color': '#e74c3c',
+      }}
+    }},
+    {{
+      selector: 'node[type="aggregated"]',
+      style: {{
+        'shape': 'roundrectangle',
+        'label': 'data(label)',
+        'text-wrap': 'wrap',
+        'text-valign': 'center',
+        'text-halign': 'center',
+        'font-size': '11px',
+        'width': 'label',
+        'height': 'label',
+        'padding': '14px',
+        'background-color': '#2a4a7f',
+        'color': '#e0e0e0',
+        'border-width': 1,
+        'border-color': '#3a6abf',
+      }}
+    }},
+    {{
+      selector: ':parent',
+      style: {{
+        'background-opacity': 0.1,
+        'background-color': '#555',
+        'border-width': 1,
+        'border-style': 'dashed',
+        'border-color': '#777',
+        'label': 'data(label)',
+        'text-valign': 'top',
+        'text-halign': 'center',
+        'font-size': '12px',
+        'color': '#aaa',
+        'padding': '20px',
+      }}
+    }},
+    {{
+      selector: 'edge',
+      style: {{
+        'width': 'data(width)',
+        'line-color': 'data(color)',
+        'target-arrow-color': 'data(color)',
+        'target-arrow-shape': 'triangle',
+        'curve-style': 'bezier',
+        'label': 'data(label)',
+        'font-size': '8px',
+        'color': '#aaa',
+        'text-rotation': 'autorotate',
+        'text-margin-y': -10,
+      }}
+    }},
+    {{
+      selector: 'edge[?dashed]',
+      style: {{
+        'line-style': 'dashed',
+      }}
+    }},
+    {{
+      selector: ':selected',
+      style: {{
+        'border-width': 3,
+        'border-color': '#e2b340',
+      }}
+    }},
+  ],
+  layout: {{ name: 'dagre', rankDir: 'TB', nodeSep: 40, rankSep: 60 }},
+  wheelSensitivity: 0.3,
+}});
+
+// --- Controls ---
+document.getElementById('fit-btn').addEventListener('click', () => cy.fit(null, 40));
+
+document.getElementById('filter-input').addEventListener('input', (e) => {{
+  const q = e.target.value.toLowerCase();
+  cy.nodes().forEach(n => {{
+    const kernelData = (n.data('kernel') || n.data('label') || '').toLowerCase();
+    if (!q || kernelData.includes(q)) {{
+      n.style('opacity', 1);
+      n.connectedEdges().style('opacity', 1);
+    }} else {{
+      n.style('opacity', 0.15);
+      n.connectedEdges().style('opacity', 0.08);
+    }}
+  }});
+}});
+
+document.getElementById('layout-select').addEventListener('change', (e) => {{
+  const name = e.target.value;
+  const opts = name === 'dagre'
+    ? {{ name: 'dagre', rankDir: 'TB', nodeSep: 40, rankSep: 60 }}
+    : name === 'breadthfirst'
+      ? {{ name: 'breadthfirst', directed: true, spacingFactor: 1.2 }}
+      : {{ name: 'cose', idealEdgeLength: 120, nodeRepulsion: 8000, animate: false }};
+  cy.layout(opts).run();
+}});
+
+// --- Details panel ---
+cy.on('tap', 'node', (evt) => {{
+  const d = evt.target.data();
+  const panel = document.getElementById('details');
+  let html = '<h3>' + (d.label || d.id) + '</h3><table>';
+  if (d.type === 'dispatch') {{
+    html += '<tr><td>ID</td><td>D' + d.dispatch_id + '</td></tr>';
+    html += '<tr><td>Kernel</td><td>' + d.kernel + '</td></tr>';
+    html += '<tr><td>CB</td><td>#' + d.cb + '</td></tr>';
+    html += '<tr><td>Encoder</td><td>#' + d.encoder + '</td></tr>';
+    html += '<tr><td>Buffers</td><td>' + d.buf_count + '</td></tr>';
+    if (d.threadgroups) html += '<tr><td>Threadgroups</td><td>' + d.threadgroups + '</td></tr>';
+    if (d.tpt) html += '<tr><td>Threads/TG</td><td>' + d.tpt + '</td></tr>';
+  }} else if (d.type === 'aggregated') {{
+    html += '<tr><td>ID</td><td>' + d.id + '</td></tr>';
+    html += '<tr><td>Dispatches</td><td>' + d.dispatch_count + '</td></tr>';
+    if (d.barrier_count) html += '<tr><td>Barriers</td><td>' + d.barrier_count + '</td></tr>';
+    if (d.composition) {{
+      html += '<tr><td>Kernels</td><td>';
+      const comp = d.composition;
+      for (const [k, c] of Object.entries(comp)) html += k + ' (' + c + ')<br/>';
+      html += '</td></tr>';
+    }}
+  }} else if (d.type === 'barrier') {{
+    html += '<tr><td>Barrier</td><td>#' + d.barrier_id + '</td></tr>';
+    html += '<tr><td>Scope</td><td>' + d.scope + '</td></tr>';
+  }}
+  html += '</table>';
+  panel.innerHTML = html;
+  panel.style.display = 'block';
+}});
+
+cy.on('tap', (evt) => {{
+  if (evt.target === cy) document.getElementById('details').style.display = 'none';
+}});
+</script>
+</body>
+</html>
+"""
+
+
+def _dispatch_graph_to_cytoscape(
+    graph: DependencyGraph,
+    barriers: list[BarrierNode] | None = None,
+) -> dict[str, Any]:
+    """Convert a dispatch-level DependencyGraph to Cytoscape.js elements."""
+    elements: list[dict[str, Any]] = []
+
+    # Compound parent nodes for command buffer clusters
+    cb_indices = sorted({n.command_buffer_idx for n in graph.nodes if n.command_buffer_idx >= 0})
+    for cb_idx in cb_indices:
+        elements.append({
+            "data": {
+                "id": f"cb_group_{cb_idx}",
+                "label": f"Command Buffer #{cb_idx}",
+                "type": "cluster",
+            },
+        })
+
+    # Dispatch nodes
+    for node in graph.nodes:
+        kernel = node.kernel
+        if len(kernel) > 40:
+            kernel = kernel[:37] + "..."
+        tg_str = ""
+        if node.threadgroups:
+            tg_str = "x".join(str(x) for x in node.threadgroups)
+        tpt_str = ""
+        if node.threads_per_threadgroup:
+            tpt_str = "x".join(str(x) for x in node.threads_per_threadgroup)
+        label = f"D{node.dispatch_id}: {kernel}"
+        if tg_str:
+            label += f"\\ntg={tg_str}"
+        label += f"\\nbufs={len(node.buffers)}"
+
+        data: dict[str, Any] = {
+            "id": f"D{node.dispatch_id}",
+            "label": label,
+            "type": "dispatch",
+            "dispatch_id": node.dispatch_id,
+            "kernel": node.kernel,
+            "cb": node.command_buffer_idx,
+            "encoder": node.encoder_idx,
+            "buf_count": len(node.buffers),
+        }
+        if tg_str:
+            data["threadgroups"] = tg_str
+        if tpt_str:
+            data["tpt"] = tpt_str
+        if node.command_buffer_idx >= 0:
+            data["parent"] = f"cb_group_{node.command_buffer_idx}"
+
+        elements.append({"data": data})
+
+    # Barrier nodes
+    if barriers:
+        for b in barriers:
+            if b.after_dispatch_id < 0:
+                continue
+            scope_label = "B" if b.scope == "buffers" else "R"
+            data = {
+                "id": f"barrier{b.barrier_id}",
+                "label": scope_label,
+                "type": "barrier",
+                "barrier_id": b.barrier_id,
+                "scope": b.scope,
+            }
+            if b.command_buffer_idx >= 0:
+                data["parent"] = f"cb_group_{b.command_buffer_idx}"
+            elements.append({"data": data})
+
+    # Dependency edges
+    for edge in graph.edges:
+        dep_type = edge.dep_type.value
+        color = _DEP_EDGE_COLORS.get(dep_type, "#999")
+        is_barrier_edge = edge.buffer_addr == 0
+        data: dict[str, Any] = {
+            "id": f"e_{edge.source_id}_{edge.target_id}",
+            "source": f"D{edge.source_id}",
+            "target": f"D{edge.target_id}",
+            "label": "barrier" if is_barrier_edge else dep_type,
+            "color": "#e63946" if is_barrier_edge else color,
+            "width": 2 if is_barrier_edge else 1.5,
+            "dashed": is_barrier_edge,
+        }
+        elements.append({"data": data})
+
+    # Barrier visual edges (diamond between dispatches)
+    if barriers:
+        enc_dispatches: dict[int, list[int]] = defaultdict(list)
+        for node in graph.nodes:
+            enc_dispatches[node.encoder_idx].append(node.dispatch_id)
+
+        for b in barriers:
+            if b.after_dispatch_id < 0:
+                continue
+            dispatches_in_enc = enc_dispatches.get(b.encoder_idx, [])
+            after = [d for d in dispatches_in_enc if d > b.after_dispatch_id]
+            if after:
+                elements.append({"data": {
+                    "id": f"be_pre_{b.barrier_id}",
+                    "source": f"D{b.after_dispatch_id}",
+                    "target": f"barrier{b.barrier_id}",
+                    "label": "",
+                    "color": "#e63946",
+                    "width": 1.5,
+                    "dashed": True,
+                }})
+                elements.append({"data": {
+                    "id": f"be_post_{b.barrier_id}",
+                    "source": f"barrier{b.barrier_id}",
+                    "target": f"D{after[0]}",
+                    "label": "",
+                    "color": "#e63946",
+                    "width": 1.5,
+                    "dashed": True,
+                }})
+
+    return {"elements": elements}
+
+
+def _aggregated_to_cytoscape(agg: AggregatedGraph) -> dict[str, Any]:
+    """Convert an AggregatedGraph to Cytoscape.js elements."""
+    elements: list[dict[str, Any]] = []
+
+    # Cluster parent nodes
+    if agg.clusters:
+        for cluster_label, node_ids in sorted(agg.clusters.items()):
+            cluster_id = f"cluster_{cluster_label.replace(' ', '_').replace('#', '')}"
+            elements.append({
+                "data": {
+                    "id": cluster_id,
+                    "label": cluster_label,
+                    "type": "cluster",
+                },
+            })
+            # Tag child nodes with parent
+            for nid in node_ids:
+                # Will be matched below when creating nodes
+                pass  # parent set in loop below
+
+    # Build cluster lookup
+    cluster_parent: dict[str, str] = {}
+    if agg.clusters:
+        for cluster_label, node_ids in agg.clusters.items():
+            cluster_id = f"cluster_{cluster_label.replace(' ', '_').replace('#', '')}"
+            for nid in node_ids:
+                cluster_parent[nid] = cluster_id
+
+    # Aggregated nodes
+    for node in agg.nodes:
+        label = node.label.replace("\\n", "\n")
+        data: dict[str, Any] = {
+            "id": node.node_id,
+            "label": label,
+            "type": "aggregated",
+            "dispatch_count": node.dispatch_count,
+            "barrier_count": node.barrier_count,
+            "composition": node.kernel_composition,
+        }
+        if node.node_id in cluster_parent:
+            data["parent"] = cluster_parent[node.node_id]
+        elements.append({"data": data})
+
+    # Aggregated edges
+    for edge in sorted(agg.edges, key=lambda e: -e.weight):
+        pw = min(1 + edge.weight / 50, 5)
+        elements.append({"data": {
+            "id": f"e_{edge.source_id}_{edge.target_id}",
+            "source": edge.source_id,
+            "target": edge.target_id,
+            "label": str(edge.weight),
+            "color": "#6c757d",
+            "width": pw,
+            "dashed": False,
+        }})
+
+    return {"elements": elements}
+
+
+def format_html(
+    graph: DependencyGraph,
+    scale: str,
+    agg: AggregatedGraph | None = None,
+    barriers: list[BarrierNode] | None = None,
+    title: str = "GPU Dependency Graph",
+) -> str:
+    """Format the dependency graph as a self-contained interactive HTML file.
+
+    Uses Cytoscape.js with dagre layout for DAG-aware rendering.
+
+    Args:
+        graph: The dispatch-level dependency graph.
+        scale: Graph scale ("dispatch", "encoder", "cb", "kernel").
+        agg: Pre-built aggregated graph (for encoder/cb/kernel scales).
+        barriers: Barrier nodes for dispatch-level rendering.
+        title: Page title.
+    """
+    if scale == "dispatch":
+        cyto_data = _dispatch_graph_to_cytoscape(graph, barriers=barriers)
+    else:
+        assert agg is not None, f"Aggregated graph required for scale={scale}"
+        cyto_data = _aggregated_to_cytoscape(agg)
+
+    cyto_data["scale"] = scale
+    cyto_data["title"] = title
+
+    graph_json = json.dumps(cyto_data)
+    return _HTML_TEMPLATE.format(
+        title=f"{title} ({scale})",
+        graph_json=graph_json,
+    )
+
+
 def _compute_critical_path_length(graph: DependencyGraph) -> int:
     """Compute the longest path in the DAG (critical path length)."""
     if not graph.nodes:
@@ -1170,7 +1638,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "-f", "--format",
-        choices=["dot", "json", "both"],
+        choices=["dot", "json", "html", "both"],
         default="both",
         help="Output format (default: both)",
     )
@@ -1223,6 +1691,11 @@ def parse_args() -> argparse.Namespace:
         "--include-isolated",
         action="store_true",
         help="Include isolated nodes (no edges) in DOT output",
+    )
+    p.add_argument(
+        "--open",
+        action="store_true",
+        help="Auto-open the output file in browser (most useful with -f html)",
     )
     return p.parse_args()
 
@@ -1431,6 +1904,38 @@ def main() -> None:
             }
         json_path.write_text(json.dumps(json_data, indent=2))
         log.info("JSON written to: %s", json_path)
+
+    # Output HTML
+    output_path = None
+    if args.format == "html":
+        html_path = base
+        if not str(html_path).endswith(".html"):
+            html_path = html_path.with_suffix(".html")
+        if suffix:
+            html_path = html_path.with_stem(html_path.stem + suffix)
+        html_content = format_html(
+            graph, scale=scale, agg=agg,
+            barriers=barriers if barriers else None,
+            title=Path(args.trace_path).stem,
+        )
+        html_path.write_text(html_content)
+        log.info("HTML written to: %s (%s scale)", html_path, scale)
+        output_path = html_path
+
+    # Auto-open in browser
+    if args.open:
+        if output_path is None:
+            # Pick the most useful file to open
+            if args.format == "dot":
+                output_path = dot_path  # type: ignore[possibly-undefined]
+            elif args.format == "json":
+                output_path = json_path  # type: ignore[possibly-undefined]
+            else:
+                # 'both' format — open DOT SVG suggestion isn't useful, skip
+                log.info("Use -f html --open for interactive browser view")
+                return
+        webbrowser.open(f"file://{output_path.resolve()}")
+        log.info("Opened in browser: %s", output_path)
 
 
 if __name__ == "__main__":

@@ -29,12 +29,15 @@ from gputrace_depgraph import (  # noqa: I001
     extract_dispatches,
     format_aggregated_dot,
     format_dot,
+    format_html,
     format_json,
     format_kernel_dot,
     transitive_reduction,
     validate_dag,
     _apply_filters,
+    _aggregated_to_cytoscape,
     _compute_critical_path_length,
+    _dispatch_graph_to_cytoscape,
 )
 
 
@@ -900,3 +903,227 @@ class TestAggregatedBarrierCounts:
         graph = build_dependency_graph(nodes, conservative=True)
         agg = build_encoder_graph(nodes, graph)
         assert "barrier" not in agg.nodes[0].label
+
+
+# ---------------------------------------------------------------------------
+# HTML output tests
+# ---------------------------------------------------------------------------
+
+class TestHtmlOutput:
+    """Test interactive HTML output with Cytoscape.js."""
+
+    def test_html_dispatch_basic(self):
+        """format_html returns valid HTML with Cytoscape.js for dispatch scale."""
+        U = AccessMode.UNKNOWN
+        nodes = [
+            _make_node(0, "kernelA", [(0x100, 0, U)], cb_idx=0, encoder_idx=0),
+            _make_node(1, "kernelB", [(0x100, 1, U)], cb_idx=0, encoder_idx=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True)
+        html = format_html(graph, scale="dispatch", title="test_trace")
+
+        assert "<!DOCTYPE html>" in html
+        assert "cytoscape.min.js" in html
+        assert "cytoscape-dagre.js" in html
+        assert "GRAPH_DATA" in html
+        assert "D0" in html
+        assert "D1" in html
+        assert "kernelA" in html
+        assert "kernelB" in html
+
+    def test_html_encoder_scale(self):
+        """format_html works with encoder-level aggregated graph."""
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_encoder_graph(nodes, graph)
+        html = format_html(graph, scale="encoder", agg=agg, title="enc_test")
+
+        assert "<!DOCTYPE html>" in html
+        assert "GRAPH_DATA" in html
+        assert "encoder" in html
+
+    def test_html_cb_scale(self):
+        """format_html works with command buffer-level aggregated graph."""
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_cb_graph(nodes, graph)
+        html = format_html(graph, scale="cb", agg=agg, title="cb_test")
+
+        assert "<!DOCTYPE html>" in html
+        assert "GRAPH_DATA" in html
+        assert "CB0" in html
+
+    def test_html_kernel_scale(self):
+        """format_html works with kernel-level aggregated graph."""
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_kernel_graph(nodes, graph)
+        html = format_html(graph, scale="kernel", agg=agg, title="kernel_test")
+
+        assert "<!DOCTYPE html>" in html
+        assert "GRAPH_DATA" in html
+
+    def test_html_with_barriers(self):
+        """format_html includes barrier nodes at dispatch scale."""
+        U = AccessMode.UNKNOWN
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, U)], cb_idx=0, encoder_idx=0),
+            _make_node(1, "kB", [(0x200, 0, U)], cb_idx=0, encoder_idx=0),
+        ]
+        barriers = [
+            BarrierNode(barrier_id=0, scope="buffers", encoder_idx=0,
+                        command_buffer_idx=0, after_dispatch_id=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True, barriers=barriers)
+        html = format_html(graph, scale="dispatch", barriers=barriers,
+                           title="barrier_test")
+
+        assert "barrier0" in html
+        assert '"type": "barrier"' in html or '"type":"barrier"' in html
+
+    def test_html_empty_graph(self):
+        """format_html handles empty graph."""
+        graph = DependencyGraph()
+        html = format_html(graph, scale="dispatch", title="empty")
+
+        assert "<!DOCTYPE html>" in html
+        assert "GRAPH_DATA" in html
+
+    def test_html_embedded_json_parseable(self):
+        """The embedded GRAPH_DATA JSON is valid and parseable."""
+        U = AccessMode.UNKNOWN
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, U)], cb_idx=0, encoder_idx=0),
+            _make_node(1, "kB", [(0x100, 1, U)], cb_idx=0, encoder_idx=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True)
+        html = format_html(graph, scale="dispatch", title="json_test")
+
+        # Extract JSON from the HTML
+        marker = "const GRAPH_DATA = "
+        start = html.index(marker) + len(marker)
+        end = html.index(";\n", start)
+        graph_json = html[start:end]
+
+        data = json.loads(graph_json)
+        assert "elements" in data
+        assert "scale" in data
+        assert data["scale"] == "dispatch"
+
+        # Check elements have dispatch nodes
+        node_ids = [
+            e["data"]["id"] for e in data["elements"]
+            if e["data"].get("type") == "dispatch"
+        ]
+        assert "D0" in node_ids
+        assert "D1" in node_ids
+
+
+class TestCytoscapeConversion:
+    """Test the Cytoscape.js data conversion helpers."""
+
+    def test_dispatch_to_cytoscape_nodes(self):
+        """_dispatch_graph_to_cytoscape creates node elements."""
+        U = AccessMode.UNKNOWN
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, U)], cb_idx=0, encoder_idx=0,
+                       threadgroups=(4, 1, 1)),
+            _make_node(1, "kB", [(0x200, 0, U)], cb_idx=1, encoder_idx=1),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True)
+        result = _dispatch_graph_to_cytoscape(graph)
+
+        elements = result["elements"]
+        # Should have cluster parents + dispatch nodes
+        dispatch_nodes = [
+            e for e in elements if e["data"].get("type") == "dispatch"
+        ]
+        assert len(dispatch_nodes) == 2
+        assert dispatch_nodes[0]["data"]["kernel"] == "kA"
+        assert dispatch_nodes[0]["data"]["parent"] == "cb_group_0"
+        assert dispatch_nodes[1]["data"]["parent"] == "cb_group_1"
+
+    def test_dispatch_to_cytoscape_edges(self):
+        """_dispatch_graph_to_cytoscape creates edge elements with colors."""
+        U = AccessMode.UNKNOWN
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, U)], cb_idx=0, encoder_idx=0),
+            _make_node(1, "kB", [(0x100, 1, U)], cb_idx=0, encoder_idx=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True)
+        result = _dispatch_graph_to_cytoscape(graph)
+
+        edges = [
+            e for e in result["elements"]
+            if "source" in e["data"] and "target" in e["data"]
+            and not e["data"]["id"].startswith("be_")
+        ]
+        assert len(edges) >= 1
+        edge = edges[0]
+        assert edge["data"]["source"] == "D0"
+        assert edge["data"]["target"] == "D1"
+        assert "color" in edge["data"]
+
+    def test_dispatch_to_cytoscape_with_barriers(self):
+        """_dispatch_graph_to_cytoscape includes barrier diamonds and edges."""
+        U = AccessMode.UNKNOWN
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, U)], cb_idx=0, encoder_idx=0),
+            _make_node(1, "kB", [(0x200, 0, U)], cb_idx=0, encoder_idx=0),
+        ]
+        barriers = [
+            BarrierNode(barrier_id=0, scope="buffers", encoder_idx=0,
+                        command_buffer_idx=0, after_dispatch_id=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True, barriers=barriers)
+        result = _dispatch_graph_to_cytoscape(graph, barriers=barriers)
+
+        barrier_nodes = [
+            e for e in result["elements"]
+            if e["data"].get("type") == "barrier"
+        ]
+        assert len(barrier_nodes) == 1
+        assert barrier_nodes[0]["data"]["scope"] == "buffers"
+
+        # Barrier visual edges (pre/post)
+        barrier_edges = [
+            e for e in result["elements"]
+            if e["data"].get("id", "").startswith("be_")
+        ]
+        assert len(barrier_edges) == 2
+
+    def test_aggregated_to_cytoscape(self):
+        """_aggregated_to_cytoscape creates elements from AggregatedGraph."""
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_encoder_graph(nodes, graph)
+        result = _aggregated_to_cytoscape(agg)
+
+        elements = result["elements"]
+        agg_nodes = [
+            e for e in elements if e["data"].get("type") == "aggregated"
+        ]
+        assert len(agg_nodes) == len(agg.nodes)
+
+        # Check composition is included
+        for node_elem in agg_nodes:
+            assert "composition" in node_elem["data"]
+            assert "dispatch_count" in node_elem["data"]
+
+    def test_aggregated_to_cytoscape_with_clusters(self):
+        """_aggregated_to_cytoscape handles cluster parent nodes."""
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_encoder_graph(nodes, graph)
+        # Encoder graph clusters by CB
+        assert agg.clusters is not None
+
+        result = _aggregated_to_cytoscape(agg)
+        cluster_nodes = [
+            e for e in result["elements"]
+            if e["data"].get("type") == "cluster"
+        ]
+        assert len(cluster_nodes) > 0
+
+        # Check that child nodes have parent set
+        agg_nodes = [
+            e for e in result["elements"]
+            if e["data"].get("type") == "aggregated"
+        ]
+        parents_set = [n for n in agg_nodes if "parent" in n["data"]]
+        assert len(parents_set) > 0
