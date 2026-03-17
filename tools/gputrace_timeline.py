@@ -347,6 +347,11 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
         # ---- Dispatch ----
 
         elif idx in (-16327, -16009):
+            # Auto-create encoder if none is active (trace may omit
+            # explicit computeCommandEncoder calls)
+            if current_encoder_idx == -1:
+                current_encoder_idx = encoder_counter
+                encoder_counter += 1
             dispatch_type = "threadgroups" if idx == -16327 else "threads"
 
             threadgroups: tuple[int, ...] | None = None
