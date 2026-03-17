@@ -1077,7 +1077,8 @@ _HTML_TEMPLATE = """\
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
          background: #1a1a2e; color: #e0e0e0; }}
-  #cy {{ width: 100vw; height: 100vh; }}
+  #cy {{ width: 100vw; height: 100vh; cursor: grab; }}
+  #cy:active {{ cursor: grabbing; }}
   #controls {{
     position: fixed; top: 12px; left: 12px; z-index: 10;
     display: flex; gap: 8px; align-items: center;
@@ -1088,6 +1089,13 @@ _HTML_TEMPLATE = """\
   }}
   #controls button:hover {{ background: #0f3460; }}
   #controls input {{ width: 180px; }}
+  #minimap {{
+    position: fixed; bottom: 50px; right: 12px; z-index: 10;
+    width: 160px; height: 120px;
+    background: #16213e; border: 1px solid #444; border-radius: 6px;
+    overflow: hidden;
+  }}
+  #minimap canvas {{ width: 100%; height: 100%; }}
   #details {{
     position: fixed; bottom: 0; right: 0; width: 340px; max-height: 50vh;
     background: #16213e; border-left: 1px solid #444; border-top: 1px solid #444;
@@ -1120,6 +1128,7 @@ _HTML_TEMPLATE = """\
 </div>
 <div id="cy"></div>
 <div id="details"></div>
+<div id="minimap"><canvas id="minimap-canvas"></canvas></div>
 <div id="legend">
   <span><span class="edge-dot" style="background:#e63946"></span>RAW</span>
   <span><span class="edge-dot" style="background:#f4a261"></span>WAW</span>
@@ -1232,7 +1241,10 @@ const cy = cytoscape({{
     }},
   ],
   layout: {{ name: 'dagre', rankDir: 'TB', nodeSep: 40, rankSep: 60 }},
+  autoungrabify: true,      // nodes locked in place — click-drag pans
   wheelSensitivity: 0.3,
+  minZoom: 0.05,
+  maxZoom: 4,
 }});
 
 // --- Controls ---
@@ -1296,6 +1308,96 @@ cy.on('tap', 'node', (evt) => {{
 
 cy.on('tap', (evt) => {{
   if (evt.target === cy) document.getElementById('details').style.display = 'none';
+}});
+
+// --- Minimap ---
+const mmCanvas = document.getElementById('minimap-canvas');
+const mmCtx = mmCanvas.getContext('2d');
+
+function drawMinimap() {{
+  const dpr = window.devicePixelRatio || 1;
+  const w = mmCanvas.parentElement.clientWidth;
+  const h = mmCanvas.parentElement.clientHeight;
+  mmCanvas.width = w * dpr;
+  mmCanvas.height = h * dpr;
+  mmCtx.scale(dpr, dpr);
+  mmCtx.clearRect(0, 0, w, h);
+
+  const bb = cy.elements().boundingBox();
+  if (bb.w === 0 || bb.h === 0) return;
+
+  const pad = 8;
+  const scaleX = (w - pad * 2) / bb.w;
+  const scaleY = (h - pad * 2) / bb.h;
+  const s = Math.min(scaleX, scaleY);
+
+  const ox = pad + ((w - pad * 2) - bb.w * s) / 2;
+  const oy = pad + ((h - pad * 2) - bb.h * s) / 2;
+
+  // Draw edges
+  mmCtx.strokeStyle = '#555';
+  mmCtx.lineWidth = 0.5;
+  cy.edges().forEach(e => {{
+    const sp = e.sourceEndpoint();
+    const tp = e.targetEndpoint();
+    mmCtx.beginPath();
+    mmCtx.moveTo(ox + (sp.x - bb.x1) * s, oy + (sp.y - bb.y1) * s);
+    mmCtx.lineTo(ox + (tp.x - bb.x1) * s, oy + (tp.y - bb.y1) * s);
+    mmCtx.stroke();
+  }});
+
+  // Draw nodes
+  cy.nodes().forEach(n => {{
+    if (n.isParent()) return;
+    const pos = n.position();
+    const nx = ox + (pos.x - bb.x1) * s;
+    const ny = oy + (pos.y - bb.y1) * s;
+    const nr = Math.max(2, Math.min(n.width(), n.height()) * s * 0.3);
+    mmCtx.fillStyle = n.data('type') === 'barrier' ? '#e63946' : '#4a80cc';
+    mmCtx.fillRect(nx - nr, ny - nr, nr * 2, nr * 2);
+  }});
+
+  // Draw viewport rectangle
+  const ext = cy.extent();
+  const vx = ox + (ext.x1 - bb.x1) * s;
+  const vy = oy + (ext.y1 - bb.y1) * s;
+  const vw = ext.w * s;
+  const vh = ext.h * s;
+  mmCtx.strokeStyle = '#e2b340';
+  mmCtx.lineWidth = 1.5;
+  mmCtx.strokeRect(vx, vy, vw, vh);
+}}
+
+cy.on('viewport', drawMinimap);
+cy.on('layoutstop', drawMinimap);
+setTimeout(drawMinimap, 200);
+
+// Click minimap to navigate
+mmCanvas.addEventListener('click', (e) => {{
+  const rect = mmCanvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const mx = (e.clientX - rect.left);
+  const my = (e.clientY - rect.top);
+  const w = mmCanvas.parentElement.clientWidth;
+  const h = mmCanvas.parentElement.clientHeight;
+
+  const bb = cy.elements().boundingBox();
+  if (bb.w === 0) return;
+  const pad = 8;
+  const scaleX = (w - pad * 2) / bb.w;
+  const scaleY = (h - pad * 2) / bb.h;
+  const s = Math.min(scaleX, scaleY);
+  const ox = pad + ((w - pad * 2) - bb.w * s) / 2;
+  const oy = pad + ((h - pad * 2) - bb.h * s) / 2;
+
+  const graphX = bb.x1 + (mx - ox) / s;
+  const graphY = bb.y1 + (my - oy) / s;
+  cy.animate({{ center: {{ x: graphX, y: graphY }}, duration: 200 }});
+}});
+
+// Re-lock nodes after layout change
+document.getElementById('layout-select').addEventListener('change', () => {{
+  cy.on('layoutstop', () => cy.autoungrabify(true));
 }});
 </script>
 </body>
