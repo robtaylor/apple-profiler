@@ -331,6 +331,22 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                             "index": func_idx,
                         })
                         break
+                    # Pre-capture pipeline: address isn't in the
+                    # pipelines dict but looks like a pipeline pointer
+                    # (not the encoder's decimal address).  Label it
+                    # the same way Xcode does.  Don't add to pipelines
+                    # dict — a later newComputePipelineState may
+                    # register the real name for this address.
+                    if data_addr > 0xFFFF:
+                        name = f"Compute Pipeline 0x{data_addr:x}"
+                        current_pipeline_name = name
+                        events.append({
+                            "type": "set_pipeline",
+                            "kernel": name,
+                            "pipeline_addr": data_addr,
+                            "index": func_idx,
+                        })
+                        break
 
         # ---- Buffer bindings ----
 
