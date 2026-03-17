@@ -821,10 +821,11 @@ def build_encoder_graph(
         agg_edges[key].weight += 1
         agg_edges[key].buffer_addrs.add(edge.buffer_addr)
 
-    # Build clusters by command buffer
+    # Build clusters by command buffer (skip unassigned cb_idx=-1)
     clusters: dict[str, list[str]] = defaultdict(list)
     for nid, cb_idx in enc_to_cb.items():
-        clusters[f"CB #{cb_idx}"].append(nid)
+        if cb_idx >= 0:
+            clusters[f"CB #{cb_idx}"].append(nid)
 
     return AggregatedGraph(
         nodes=list(agg_nodes.values()),
@@ -1282,8 +1283,8 @@ cy.on('tap', 'node', (evt) => {{
   if (d.type === 'dispatch') {{
     html += '<tr><td>ID</td><td>D' + d.dispatch_id + '</td></tr>';
     html += '<tr><td>Kernel</td><td>' + d.kernel + '</td></tr>';
-    html += '<tr><td>CB</td><td>#' + d.cb + '</td></tr>';
-    html += '<tr><td>Encoder</td><td>#' + d.encoder + '</td></tr>';
+    html += '<tr><td>CB</td><td>' + (d.cb >= 0 ? '#' + d.cb : 'unassigned') + '</td></tr>';
+    html += '<tr><td>Encoder</td><td>' + (d.encoder >= 0 ? '#' + d.encoder : 'unassigned') + '</td></tr>';
     html += '<tr><td>Buffers</td><td>' + d.buf_count + '</td></tr>';
     if (d.threadgroups) html += '<tr><td>Threadgroups</td><td>' + d.threadgroups + '</td></tr>';
     if (d.tpt) html += '<tr><td>Threads/TG</td><td>' + d.tpt + '</td></tr>';
