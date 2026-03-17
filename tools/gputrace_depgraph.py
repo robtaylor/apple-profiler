@@ -1109,6 +1109,7 @@ _HTML_TEMPLATE = """\
 <script src="https://unpkg.com/cytoscape@3/dist/cytoscape.min.js"></script>
 <script src="https://unpkg.com/dagre@0.8/dist/dagre.min.js"></script>
 <script src="https://unpkg.com/cytoscape-dagre@2/cytoscape-dagre.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-tidytree/dist/cytoscape-tidytree.min.js"></script>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -1157,6 +1158,7 @@ _HTML_TEMPLATE = """\
   <button id="fit-btn" title="Fit to screen">Fit</button>
   <input id="filter-input" type="text" placeholder="Filter by kernel name..." />
   <select id="layout-select">
+    <option value="tidytree">Tidy Tree</option>
     <option value="dagre">Dagre (DAG)</option>
     <option value="breadthfirst">Breadthfirst</option>
     <option value="cose">Force-directed</option>
@@ -1254,7 +1256,9 @@ const cy = cytoscape({{
         'line-color': 'data(color)',
         'target-arrow-color': 'data(color)',
         'target-arrow-shape': 'triangle',
-        'curve-style': 'bezier',
+        'curve-style': 'round-taxi',
+        'taxi-direction': 'downward',
+        'taxi-turn-min-distance': 15,
         'label': 'data(label)',
         'font-size': '8px',
         'color': '#aaa',
@@ -1276,7 +1280,7 @@ const cy = cytoscape({{
       }}
     }},
   ],
-  layout: {{ name: 'dagre', rankDir: 'TB', nodeSep: 40, rankSep: 60 }},
+  layout: {{ name: 'tidytree', direction: 'TB', horizontalSpacing: 40, verticalSpacing: 60 }},
   autoungrabify: true,      // nodes locked in place — click-drag pans
   wheelSensitivity: 0.3,
   minZoom: 0.05,
@@ -1300,13 +1304,15 @@ document.getElementById('filter-input').addEventListener('input', (e) => {{
   }});
 }});
 
+const LAYOUTS = {{
+  tidytree: {{ name: 'tidytree', direction: 'TB', horizontalSpacing: 40, verticalSpacing: 60 }},
+  dagre: {{ name: 'dagre', rankDir: 'TB', nodeSep: 40, rankSep: 60 }},
+  breadthfirst: {{ name: 'breadthfirst', directed: true, spacingFactor: 1.2 }},
+  cose: {{ name: 'cose', idealEdgeLength: 120, nodeRepulsion: 8000, animate: false }},
+}};
+
 document.getElementById('layout-select').addEventListener('change', (e) => {{
-  const name = e.target.value;
-  const opts = name === 'dagre'
-    ? {{ name: 'dagre', rankDir: 'TB', nodeSep: 40, rankSep: 60 }}
-    : name === 'breadthfirst'
-      ? {{ name: 'breadthfirst', directed: true, spacingFactor: 1.2 }}
-      : {{ name: 'cose', idealEdgeLength: 120, nodeRepulsion: 8000, animate: false }};
+  const opts = LAYOUTS[e.target.value] || LAYOUTS.tidytree;
   cy.layout(opts).run();
 }});
 
