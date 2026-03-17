@@ -62,6 +62,7 @@ import argparse
 import fnmatch
 import json
 import logging
+import re
 import webbrowser
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -1652,25 +1653,15 @@ def _dispatch_graph_to_cytoscape(
     return {"elements": elements}
 
 
+def _cluster_sort_key(label: str) -> tuple[int, str]:
+    """Sort cluster labels numerically: 'CB #2 (...)' before 'CB #10 (...)'."""
+    m = re.search(r"#(\d+)", label)
+    return (int(m.group(1)) if m else 0, label)
+
+
 def _aggregated_to_cytoscape(agg: AggregatedGraph) -> dict[str, Any]:
     """Convert an AggregatedGraph to Cytoscape.js elements."""
     elements: list[dict[str, Any]] = []
-
-    # Cluster parent nodes
-    if agg.clusters:
-        for cluster_label, node_ids in sorted(agg.clusters.items()):
-            cluster_id = f"cluster_{cluster_label.replace(' ', '_').replace('#', '')}"
-            elements.append({
-                "data": {
-                    "id": cluster_id,
-                    "label": cluster_label,
-                    "type": "cluster",
-                },
-            })
-            # Tag child nodes with parent
-            for nid in node_ids:
-                # Will be matched below when creating nodes
-                pass  # parent set in loop below
 
     # Build cluster lookup
     cluster_parent: dict[str, str] = {}
@@ -1680,8 +1671,43 @@ def _aggregated_to_cytoscape(agg: AggregatedGraph) -> dict[str, Any]:
             for nid in node_ids:
                 cluster_parent[nid] = cluster_id
 
-    # Aggregated nodes
+    # Emit clusters and their children together (helps dagre layout order)
+    children_by_cluster: dict[str, list] = {}
+    node_lookup = {n.node_id: n for n in agg.nodes}
+    emitted: set[str] = set()
+
+    if agg.clusters:
+        for cluster_label, node_ids in sorted(agg.clusters.items(), key=lambda x: _cluster_sort_key(x[0])):
+            cluster_id = f"cluster_{cluster_label.replace(' ', '_').replace('#', '')}"
+            elements.append({
+                "data": {
+                    "id": cluster_id,
+                    "label": cluster_label,
+                    "type": "cluster",
+                },
+            })
+            # Emit child nodes immediately after their cluster
+            for nid in node_ids:
+                node = node_lookup.get(nid)
+                if node is None:
+                    continue
+                label = node.label.replace("\\n", "\n")
+                data: dict[str, Any] = {
+                    "id": node.node_id,
+                    "label": label,
+                    "type": "aggregated",
+                    "dispatch_count": node.dispatch_count,
+                    "barrier_count": node.barrier_count,
+                    "composition": node.kernel_composition,
+                    "parent": cluster_id,
+                }
+                elements.append({"data": data})
+                emitted.add(nid)
+
+    # Emit any remaining nodes not in clusters
     for node in agg.nodes:
+        if node.node_id in emitted:
+            continue
         label = node.label.replace("\\n", "\n")
         data: dict[str, Any] = {
             "id": node.node_id,
