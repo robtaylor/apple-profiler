@@ -1167,8 +1167,8 @@ _HTML_TEMPLATE = """\
   <button id="search-prev" title="Previous match" style="display:none">&uarr;</button>
   <button id="search-next" title="Next match" style="display:none">&darr;</button>
   <select id="layout-select">
-    <option value="tidytree">Tidy Tree</option>
     <option value="dagre">Dagre (DAG)</option>
+    <option value="tidytree">Tidy Tree</option>
     <option value="breadthfirst">Breadthfirst</option>
     <option value="cose">Force-directed</option>
   </select>
@@ -1289,7 +1289,7 @@ const cy = cytoscape({{
       }}
     }},
   ],
-  layout: {{ name: 'tidytree', direction: 'TB', horizontalSpacing: 40, verticalSpacing: 60 }},
+  layout: {{ name: 'dagre', rankDir: 'TB', nodeSep: 40, rankSep: 60 }},
   autoungrabify: true,      // nodes locked in place — click-drag pans
   wheelSensitivity: 0.3,
   minZoom: 0.05,
@@ -1392,7 +1392,7 @@ const LAYOUTS = {{
 }};
 
 document.getElementById('layout-select').addEventListener('change', (e) => {{
-  const opts = LAYOUTS[e.target.value] || LAYOUTS.tidytree;
+  const opts = LAYOUTS[e.target.value] || LAYOUTS.dagre;
   cy.layout(opts).run();
 }});
 
