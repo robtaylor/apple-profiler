@@ -220,6 +220,142 @@ case 5:
     cb2.commit()
     cb2.waitUntilCompleted()
 
+case 6:
+    // VARIANT 6: Blit command encoder (test if endEncoding has different idx)
+    print("  Blit encoder (copy buffer)")
+    let cb = queue.makeCommandBuffer()!
+    let blitEnc = cb.makeBlitCommandEncoder()!
+    blitEnc.copy(from: bufA, sourceOffset: 0, to: bufB, destinationOffset: 0, size: count * MemoryLayout<Float>.stride)
+    blitEnc.endEncoding()
+    cb.commit()
+    cb.waitUntilCompleted()
+
+case 7:
+    // VARIANT 7: makeBuffer(bytes:length:options:) to find -16314
+    print("  makeBuffer(bytes:) instead of makeBuffer(length:)")
+    var data = [Float](repeating: 1.0, count: count)
+    let bufC = device.makeBuffer(bytes: &data,
+                                  length: count * MemoryLayout<Float>.stride,
+                                  options: .storageModeShared)!
+    let cb = queue.makeCommandBuffer()!
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(addPipeline)
+    enc.setBuffer(bufC, offset: 0, index: 0)
+    enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: count, height: 1, depth: 1))
+    enc.endEncoding()
+    cb.commit()
+    cb.waitUntilCompleted()
+
+case 8:
+    // VARIANT 8: addCompletedHandler to find -15990
+    print("  addCompletedHandler")
+    let cb = queue.makeCommandBuffer()!
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(addPipeline)
+    enc.setBuffer(bufA, offset: 0, index: 0)
+    enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: count, height: 1, depth: 1))
+    enc.endEncoding()
+    let sem = DispatchSemaphore(value: 0)
+    cb.addCompletedHandler { _ in
+        print("    Completed handler fired")
+        sem.signal()
+    }
+    cb.commit()
+    sem.wait()
+
+case 9:
+    // VARIANT 9: MTLComputePipelineDescriptor to find -15996
+    print("  makeComputePipelineState(descriptor:)")
+    let descriptor = MTLComputePipelineDescriptor()
+    descriptor.computeFunction = addFn
+    descriptor.label = "test_descriptor_pipeline"
+    let descPipeline = try! device.makeComputePipelineState(descriptor: descriptor, options: [], reflection: nil)
+
+    let cb = queue.makeCommandBuffer()!
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(descPipeline)
+    enc.setBuffer(bufA, offset: 0, index: 0)
+    enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: count, height: 1, depth: 1))
+    enc.endEncoding()
+    cb.commit()
+    cb.waitUntilCompleted()
+
+case 10:
+    // VARIANT 10: MTLSharedEvent to find -15422
+    print("  MTLSharedEvent signaling")
+    let event = device.makeSharedEvent()!
+    let listener = MTLSharedEventListener()
+
+    let cb = queue.makeCommandBuffer()!
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(addPipeline)
+    enc.setBuffer(bufA, offset: 0, index: 0)
+    enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: count, height: 1, depth: 1))
+    enc.endEncoding()
+
+    // Signal event after dispatch completes
+    cb.encodeSignalEvent(event, value: 1)
+    cb.commit()
+
+    // Wait on CPU side for the event
+    let sem = DispatchSemaphore(value: 0)
+    event.notify(listener, atValue: 1) { _, _ in
+        print("    Event signaled")
+        sem.signal()
+    }
+    sem.wait()
+
+case 11:
+    // VARIANT 11: Pre-compiled metallib loaded with newLibraryWithURL
+    // to test if -16290 (newFunctionWithName) appears separately
+    print("  Load metallib from file")
+    // First compile to a metallib file
+    let metalSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void add_one(device float* buf [[buffer(0)]],
+                        uint tid [[thread_position_in_grid]]) {
+        buf[tid] = buf[tid] + 1.0;
+    }
+    """
+    let tempLib = try! device.makeLibrary(source: metalSource, options: nil)
+    // We can't easily save a metallib at runtime, so instead just call
+    // makeFunction(name:) explicitly on the source-compiled library
+    // to see what index it produces
+    let fn = tempLib.makeFunction(name: "add_one")!
+    let pl = try! device.makeComputePipelineState(function: fn)
+
+    let cb = queue.makeCommandBuffer()!
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(pl)
+    enc.setBuffer(bufA, offset: 0, index: 0)
+    enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: count, height: 1, depth: 1))
+    enc.endEncoding()
+    cb.commit()
+    cb.waitUntilCompleted()
+
+case 12:
+    // VARIANT 12: setPurgeableState to find -16371
+    print("  setPurgeableState on buffer")
+    let _ = bufA.setPurgeableState(.nonVolatile)
+    let _ = bufA.setPurgeableState(.volatile)
+    let _ = bufA.setPurgeableState(.nonVolatile)
+
+    let cb = queue.makeCommandBuffer()!
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(addPipeline)
+    enc.setBuffer(bufA, offset: 0, index: 0)
+    enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: count, height: 1, depth: 1))
+    enc.endEncoding()
+    cb.commit()
+    cb.waitUntilCompleted()
+
 default:
     fatalError("Unknown variant \(variant)")
 }

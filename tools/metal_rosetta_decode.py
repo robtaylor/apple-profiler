@@ -85,7 +85,9 @@ KNOWN = {
     -16290: "newFunctionWithName:",
     -16227: "setBytes:inline",
     -16067: "supportsFamily:",
+    -16078: "dispatchThreads:",
     -16009: "memoryBarrierWithScope:",
+    -16008: "memoryBarrier(resources:)",
     -15996: "newCPSwithDescriptor:",
     -15990: "addCompletedHandler:",
     -15736: "newLibraryWithURL:",
@@ -104,16 +106,25 @@ VARIANT_LABELS = {
     3: "Two encoders in one command buffer",
     4: "memoryBarrier(resources:) instead of scope",
     5: "Two command buffers",
+    6: "Blit encoder (test endEncoding index)",
+    7: "makeBuffer(bytes:) — test -16314",
+    8: "addCompletedHandler — test -15990",
+    9: "makeComputePipelineState(descriptor:) — test -15996",
+    10: "MTLSharedEvent — test -15422",
+    11: "makeFunction(name:) — test -16290",
+    12: "setPurgeableState — test -16371",
 }
 
 base_dir = "/tmp/claude/barrier_test"
 
-for v in range(6):
+MAX_V = 13
+for v in range(MAX_V):
     path = f"{base_dir}/rosetta_v{v}.gputrace"
     if not os.path.exists(path):
         continue
+    label = VARIANT_LABELS.get(v, f"Variant {v}")
     print(f"\n{'='*80}")
-    print(f"VARIANT {v}: {VARIANT_LABELS[v]}")
+    print(f"VARIANT {v}: {label}")
     print(f"{'='*80}")
     funcs = read_stream(path)
     for i, (idx, trace) in enumerate(funcs):
@@ -135,7 +146,7 @@ print("CROSS-VARIANT INDEX COMPARISON")
 print(f"{'='*80}")
 
 all_indices: dict[int, set[int]] = {}  # idx -> set of variants containing it
-for v in range(6):
+for v in range(MAX_V):
     path = f"{base_dir}/rosetta_v{v}.gputrace"
     if not os.path.exists(path):
         continue
