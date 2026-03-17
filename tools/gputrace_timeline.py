@@ -96,27 +96,39 @@ DYFunctionTracer = objc.lookUpClass("DYFunctionTracer")
 # May change across Xcode versions.
 
 FUNC_NAMES: dict[int, str] = {
-    -16371: "setPurgeableState:",
-    -16370: "endEncoding",
+    -16383: "endEncoding (blit, GPUTools tracking)",
+    -16377: "blit.copy(from:to:)",
+    -16376: "endEncoding (blit)",
+    -16371: "setPurgeableState: (GPUTools-inserted)",
+    -16370: "endEncoding (GPUTools blit encoder)",
+    -16367: "setPurgeableState: (user)",
     -16363: "MTLCommandBuffer.commit",
     -16361: "MTLCommandBuffer.waitUntilCompleted",
+    -16356: "addCompletedHandler:",
     -16355: "MTLCommandBuffer.computeCommandEncoder",
+    -16354: "makeBlitCommandEncoder",
     -16352: "MTLCommandQueue.commandBuffer",
-    -16343: "MTLDevice.newBufferWithLength:options:",
+    -16343: "MTLDevice.makeBuffer(length:options:)",
     -16338: "setComputePipelineState:",
     -16337: "setBytes:length:atIndex:",
     -16336: "setBuffer:offset:atIndex:",
     -16327: "dispatchThreadgroups:threadsPerThreadgroup:",
-    -16325: "endEncoding",
-    -16314: "MTLDevice.newBufferWithBytes:length:options:",
-    -16299: "MTLDevice.newComputePipelineStateWithFunction:error:",
-    -16290: "MTLLibrary.newFunctionWithName:",
+    -16325: "endEncoding (compute)",
+    -16316: "makeComputePipelineState(function:)",
+    -16314: "makeBuffer(length:) variant",
+    -16313: "makeBuffer(bytes:length:options:)",
+    -16305: "makeLibrary(source:options:)",
+    -16299: "newComputePipelineStateWithFunction:error:",
+    -16290: "makeFunction(name:)",
     -16227: "setBytes:length:atIndex: (inline)",
-    -16067: "MTLDevice.supportsFamily:",
-    -16009: "dispatchThreads:threadsPerThreadgroup:",
-    -15996: "MTLDevice.newComputePipelineStateWithDescriptor:error:",
-    -15990: "MTLCommandBuffer.addCompletedHandler:",
-    -15736: "MTLDevice.newLibraryWithURL:error:",
+    -16078: "dispatchThreads:threadsPerThreadgroup:",
+    -16067: "supportsFamily:",
+    -16009: "memoryBarrierWithScope:",
+    -16008: "memoryBarrier(resources:)",
+    -15996: "makeSharedEvent()",
+    -15990: "encodeSignalEvent / event.notify()",
+    -15973: "event cleanup",
+    -15736: "newLibraryWithURL:",
     -15422: "MTLSharedEvent.notifyListener:atValue:",
     -10228: "internal.bufferDidModify",
     -10223: "internal.bufferContents",
@@ -127,8 +139,8 @@ FUNC_NAMES: dict[int, str] = {
 
 # Function indices that need trace-text argument parsing.
 _TRACE_INDICES = frozenset({
-    -16290, -16299, -15996, -16352, -16355, -16338,
-    -16337, -16336, -16327, -16009,
+    -16290, -16299, -16352, -16355, -16338,
+    -16337, -16336, -16327, -16078, -16009,
 })
 
 
@@ -239,13 +251,10 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                         pipelines[pipeline_addr] = f"pipeline_0x{pipeline_addr:x}"
                         last_created_pipeline = pipelines[pipeline_addr]
 
-        elif idx == -15996:  # newComputePipelineStateWithDescriptor:error:
-            if trace and "=" in trace:
-                ret_str = trace.split("=")[0].strip()
-                if ret_str.startswith("0x"):
-                    pipeline_addr = int(ret_str.rstrip("l"), 16)
-                    pipelines[pipeline_addr] = f"descriptor_pipeline_0x{pipeline_addr:x}"
-                    last_created_pipeline = pipelines[pipeline_addr]
+        elif idx == -15996:  # makeSharedEvent()
+            # This is an MTLSharedEvent, not a pipeline descriptor.
+            # Skip processing—shared events don't affect pipeline dispatch mapping.
+            pass
 
         # ---- Command buffer lifecycle ----
 
@@ -360,9 +369,20 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                     buf_index = int(m.group(1)) if m else -1
                     buffers_bound[buf_index] = buffer_addr
 
+        # ---- Memory barriers ----
+
+        elif idx == -16009:  # memoryBarrierWithScope:
+            event: dict[str, Any] = {
+                "type": "barrier",
+                "scope": "buffers",
+                "index": func_idx,
+                "encoder_idx": current_encoder_idx,
+            }
+            events.append(event)
+
         # ---- Dispatch ----
 
-        elif idx in (-16327, -16009):
+        elif idx in (-16327, -16078):
             # Auto-create encoder if none is active (trace may omit
             # explicit computeCommandEncoder calls)
             if current_encoder_idx == -1:
@@ -380,10 +400,13 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                 if len(struct_matches) >= 2:
                     threadgroups = tuple(int(x) for x in struct_matches[0])
                     threads_per = tuple(int(x) for x in struct_matches[1])
-            elif trace and idx == -16009:
-                m = re.search(r",\s*(\d+)ul\)", trace)
-                if m:
-                    threadgroups = (int(m.group(1)), 1, 1)
+            elif trace and idx == -16078:
+                struct_matches = re.findall(
+                    r"\{(\d+)ul,\s*(\d+)ul,\s*(\d+)ul\}", trace
+                )
+                if len(struct_matches) >= 2:
+                    threadgroups = tuple(int(x) for x in struct_matches[0])
+                    threads_per = tuple(int(x) for x in struct_matches[1])
 
             event: dict[str, Any] = {
                 "type": "dispatch",
@@ -442,7 +465,9 @@ def main() -> None:
         print(f"  0x{addr:x} -> {name}")
 
     dispatch_events = [e for e in result["events"] if e["type"] == "dispatch"]
+    barrier_events = [e for e in result["events"] if e["type"] == "barrier"]
     print(f"\nDispatch calls: {len(dispatch_events)}")
+    print(f"Memory barriers: {len(barrier_events)}")
 
     kernel_counts: dict[str, int] = defaultdict(int)
     for evt in dispatch_events:
