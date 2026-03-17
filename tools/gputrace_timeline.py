@@ -189,6 +189,11 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
     events: list[dict[str, Any]] = []
     command_buffers: list[dict[str, Any]] = []
     current_cb_dispatches: list[dict[str, Any]] = []
+    compute_encoders: list[dict[str, Any]] = []
+    current_encoder_dispatches: list[dict[str, Any]] = []
+    encoder_counter: int = 0
+    current_encoder_idx: int = -1
+    current_cb_idx: int = -1
 
     func_idx = 0
     while True:
@@ -249,8 +254,18 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                 ret_str = trace.split("=")[0].strip()
                 if ret_str.startswith("0x"):
                     current_cb_dispatches = []
+                    current_cb_idx = len(command_buffers)
 
         elif idx == -16363:  # MTLCommandBuffer.commit
+            # Close any open encoder before closing the command buffer
+            if current_encoder_dispatches:
+                compute_encoders.append({
+                    "encoder_idx": current_encoder_idx,
+                    "command_buffer_idx": current_cb_idx,
+                    "dispatches": list(current_encoder_dispatches),
+                })
+                current_encoder_dispatches = []
+                current_encoder_idx = -1
             if current_cb_dispatches:
                 command_buffers.append({
                     "func_idx": func_idx,
@@ -261,12 +276,29 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
         # ---- Encoder lifecycle ----
 
         elif idx == -16355:  # MTLCommandBuffer.computeCommandEncoder
+            # Close any previous open encoder
+            if current_encoder_dispatches:
+                compute_encoders.append({
+                    "encoder_idx": current_encoder_idx,
+                    "command_buffer_idx": current_cb_idx,
+                    "dispatches": list(current_encoder_dispatches),
+                })
+                current_encoder_dispatches = []
+            current_encoder_idx = encoder_counter
+            encoder_counter += 1
             # Don't reset pipeline — it carries over because encoder creation
             # isn't always explicit in the unsorted-capture stream.
             buffers_bound = {}
 
         elif idx in (-16325, -16370):  # endEncoding
-            pass
+            if current_encoder_dispatches:
+                compute_encoders.append({
+                    "encoder_idx": current_encoder_idx,
+                    "command_buffer_idx": current_cb_idx,
+                    "dispatches": list(current_encoder_dispatches),
+                })
+                current_encoder_dispatches = []
+                current_encoder_idx = -1
 
         # ---- Pipeline state setting ----
 
@@ -338,6 +370,7 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                 "kernel": current_pipeline_name or "unknown",
                 "index": func_idx,
                 "buffers_bound": dict(buffers_bound),
+                "encoder_idx": current_encoder_idx,
             }
             if threadgroups:
                 event["threadgroups"] = threadgroups
@@ -346,6 +379,7 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
 
             events.append(event)
             current_cb_dispatches.append(event)
+            current_encoder_dispatches.append(event)
             buffers_bound = {}
 
         func_idx += 1
@@ -357,6 +391,7 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
         "kernels": kernels,
         "pipelines": pipelines,
         "command_buffers": command_buffers,
+        "compute_encoders": compute_encoders,
     }
 
 
@@ -404,6 +439,13 @@ def main() -> None:
         print(
             f"  [{evt['index']:5d}] {evt['kernel']:45s} "
             f"tg={tg} tpt={tpt} bufs={bufs}"
+        )
+
+    print(f"\nCompute encoders: {len(result['compute_encoders'])}")
+    for i, enc in enumerate(result["compute_encoders"][:10]):
+        print(
+            f"  Encoder#{enc['encoder_idx']}: {len(enc['dispatches'])} dispatches "
+            f"(CB#{enc['command_buffer_idx']})"
         )
 
     print(f"\nCommand buffers: {len(result['command_buffers'])}")

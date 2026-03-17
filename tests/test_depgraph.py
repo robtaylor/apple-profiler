@@ -1,7 +1,8 @@
 """Tests for gputrace_depgraph core graph logic.
 
 These tests exercise the dependency graph construction, transitive reduction,
-and output formatting without requiring Apple frameworks or .gputrace files.
+output formatting, and multi-scale aggregated graph builders without requiring
+Apple frameworks or .gputrace files.
 """
 from __future__ import annotations
 
@@ -12,18 +13,26 @@ from pathlib import Path
 # Add tools dir to import the module
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 
-from gputrace_depgraph import (
+from gputrace_depgraph import (  # noqa: I001
     AccessMode,
+    AggregatedGraph,
     BufferBinding,
     DepType,
+    DependencyEdge,
     DependencyGraph,
     DispatchNode,
+    build_cb_graph,
     build_dependency_graph,
+    build_encoder_graph,
+    build_kernel_graph,
     extract_dispatches,
+    format_aggregated_dot,
     format_dot,
     format_json,
+    format_kernel_dot,
     transitive_reduction,
     validate_dag,
+    _apply_filters,
     _compute_critical_path_length,
 )
 
@@ -33,6 +42,7 @@ def _make_node(
     kernel: str,
     buffers: list[tuple[int, int, AccessMode]] | None = None,
     cb_idx: int = 0,
+    encoder_idx: int = 0,
     threadgroups: tuple[int, ...] | None = None,
 ) -> DispatchNode:
     """Helper to create a DispatchNode."""
@@ -47,6 +57,7 @@ def _make_node(
         buffers=buf_list,
         threadgroups=threadgroups,
         command_buffer_idx=cb_idx,
+        encoder_idx=encoder_idx,
     )
 
 
@@ -196,7 +207,6 @@ class TestTransitiveReduction:
             _make_node(2, "C"),
         ]
         graph = DependencyGraph(nodes=nodes)
-        from gputrace_depgraph import DependencyEdge
         graph.add_edge(DependencyEdge(0, 1, DepType.SHARED, 0x100))
         graph.add_edge(DependencyEdge(1, 2, DepType.SHARED, 0x200))
         graph.add_edge(DependencyEdge(0, 2, DepType.SHARED, 0x100))
@@ -211,7 +221,6 @@ class TestTransitiveReduction:
         """Linear chain has no redundant edges."""
         nodes = [_make_node(i, f"N{i}") for i in range(3)]
         graph = DependencyGraph(nodes=nodes)
-        from gputrace_depgraph import DependencyEdge
         graph.add_edge(DependencyEdge(0, 1, DepType.SHARED, 0x100))
         graph.add_edge(DependencyEdge(1, 2, DepType.SHARED, 0x200))
 
@@ -225,7 +234,6 @@ class TestValidation:
     def test_valid_dag(self):
         nodes = [_make_node(i, f"N{i}") for i in range(3)]
         graph = DependencyGraph(nodes=nodes)
-        from gputrace_depgraph import DependencyEdge
         graph.add_edge(DependencyEdge(0, 1, DepType.SHARED, 0x100))
         graph.add_edge(DependencyEdge(1, 2, DepType.SHARED, 0x200))
         assert validate_dag(graph) is True
@@ -241,7 +249,6 @@ class TestCriticalPath:
     def test_linear_chain(self):
         nodes = [_make_node(i, f"N{i}") for i in range(4)]
         graph = DependencyGraph(nodes=nodes)
-        from gputrace_depgraph import DependencyEdge
         for i in range(3):
             graph.add_edge(DependencyEdge(i, i + 1, DepType.SHARED, 0x100))
         assert _compute_critical_path_length(graph) == 3
@@ -250,7 +257,6 @@ class TestCriticalPath:
         """Two parallel paths: 0→1→3 and 0→2→3."""
         nodes = [_make_node(i, f"N{i}") for i in range(4)]
         graph = DependencyGraph(nodes=nodes)
-        from gputrace_depgraph import DependencyEdge
         graph.add_edge(DependencyEdge(0, 1, DepType.SHARED, 0x100))
         graph.add_edge(DependencyEdge(0, 2, DepType.SHARED, 0x200))
         graph.add_edge(DependencyEdge(1, 3, DepType.SHARED, 0x100))
@@ -317,6 +323,15 @@ class TestJsonOutput:
         assert buf["addr"] == "0xdead"
         assert buf["index"] == 5
 
+    def test_json_includes_encoder(self):
+        """JSON output includes encoder_idx for each node."""
+        nodes = [
+            _make_node(0, "k", [(0x100, 0, AccessMode.UNKNOWN)], encoder_idx=3),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True)
+        data = format_json(graph)
+        assert data["nodes"][0]["encoder"] == 3
+
 
 class TestExtractDispatches:
     """Test extraction from timeline data format."""
@@ -332,12 +347,14 @@ class TestExtractDispatches:
                     "buffers_bound": {0: 0x100, 1: 0x200},
                     "threadgroups": (4, 1, 1),
                     "threads_per_threadgroup": (256, 1, 1),
+                    "encoder_idx": 0,
                 },
                 {
                     "type": "dispatch",
                     "kernel": "k2",
                     "index": 10,
                     "buffers_bound": {0: 0x200},
+                    "encoder_idx": 1,
                 },
             ],
             "command_buffers": [
@@ -349,20 +366,261 @@ class TestExtractDispatches:
                     ],
                 },
             ],
+            "compute_encoders": [
+                {"encoder_idx": 0, "command_buffer_idx": 0, "dispatches": [{"index": 5}]},
+                {"encoder_idx": 1, "command_buffer_idx": 0, "dispatches": [{"index": 10}]},
+            ],
         }
 
-        nodes, num_cbs = extract_dispatches(trace_data)
+        nodes, num_cbs, num_encoders = extract_dispatches(trace_data)
         assert len(nodes) == 2
         assert num_cbs == 1
+        assert num_encoders == 2
         assert nodes[0].kernel == "k1"
         assert nodes[0].command_buffer_idx == 0
+        assert nodes[0].encoder_idx == 0
         assert len(nodes[0].buffers) == 2
         assert nodes[0].threadgroups == (4, 1, 1)
         assert nodes[1].kernel == "k2"
         assert nodes[1].command_buffer_idx == 0
+        assert nodes[1].encoder_idx == 1
         assert len(nodes[1].buffers) == 1
 
     def test_empty_trace(self):
-        nodes, num_cbs = extract_dispatches({"events": [], "command_buffers": []})
+        nodes, num_cbs, num_encoders = extract_dispatches(
+            {"events": [], "command_buffers": [], "compute_encoders": []}
+        )
         assert len(nodes) == 0
         assert num_cbs == 0
+        assert num_encoders == 0
+
+
+# ---------------------------------------------------------------------------
+# Aggregated graph tests
+# ---------------------------------------------------------------------------
+
+def _make_multi_cb_nodes() -> tuple[list[DispatchNode], DependencyGraph]:
+    """Create a test scenario with 2 CBs, 3 encoders, 2 kernels.
+
+    CB0: Encoder0 [D0:kA, D1:kA], Encoder1 [D2:kB]
+    CB1: Encoder2 [D3:kA, D4:kB]
+
+    Buffer hazards:
+      D0 → D1 (buf 0x100, same encoder)
+      D1 → D2 (buf 0x200, cross-encoder, same CB)
+      D2 → D3 (buf 0x300, cross-CB)
+      D3 → D4 (buf 0x100, same encoder)
+    """
+    U = AccessMode.UNKNOWN
+    nodes = [
+        _make_node(0, "kA", [(0x100, 0, U)], cb_idx=0, encoder_idx=0),
+        _make_node(1, "kA", [(0x100, 0, U), (0x200, 1, U)], cb_idx=0, encoder_idx=0),
+        _make_node(2, "kB", [(0x200, 0, U), (0x300, 1, U)], cb_idx=0, encoder_idx=1),
+        _make_node(3, "kA", [(0x300, 0, U), (0x100, 1, U)], cb_idx=1, encoder_idx=2),
+        _make_node(4, "kB", [(0x100, 0, U)], cb_idx=1, encoder_idx=2),
+    ]
+    graph = build_dependency_graph(nodes, conservative=True)
+    return nodes, graph
+
+
+class TestBuildCBGraph:
+    """Test command buffer level aggregation."""
+
+    def test_cb_graph_nodes(self):
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_cb_graph(nodes, graph)
+        assert agg.scale == "cb"
+        assert len(agg.nodes) == 2
+        ids = {n.node_id for n in agg.nodes}
+        assert ids == {"CB0", "CB1"}
+
+    def test_cb_graph_dispatch_counts(self):
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_cb_graph(nodes, graph)
+        by_id = {n.node_id: n for n in agg.nodes}
+        assert by_id["CB0"].dispatch_count == 3
+        assert by_id["CB1"].dispatch_count == 2
+
+    def test_cb_graph_kernel_composition(self):
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_cb_graph(nodes, graph)
+        by_id = {n.node_id: n for n in agg.nodes}
+        assert by_id["CB0"].kernel_composition == {"kA": 2, "kB": 1}
+        assert by_id["CB1"].kernel_composition == {"kA": 1, "kB": 1}
+
+    def test_cb_graph_cross_cb_edge(self):
+        """Only cross-CB edges appear (intra-CB skipped)."""
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_cb_graph(nodes, graph)
+        assert len(agg.edges) == 1
+        e = agg.edges[0]
+        assert e.source_id == "CB0"
+        assert e.target_id == "CB1"
+        assert e.weight >= 1
+
+    def test_cb_graph_no_intra_cb_edges(self):
+        """Edges within same CB are not in the aggregated graph."""
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_cb_graph(nodes, graph)
+        for e in agg.edges:
+            assert e.source_id != e.target_id
+
+
+class TestBuildEncoderGraph:
+    """Test encoder level aggregation."""
+
+    def test_encoder_graph_nodes(self):
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_encoder_graph(nodes, graph)
+        assert agg.scale == "encoder"
+        assert len(agg.nodes) == 3
+        ids = {n.node_id for n in agg.nodes}
+        assert ids == {"E0", "E1", "E2"}
+
+    def test_encoder_graph_dispatch_counts(self):
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_encoder_graph(nodes, graph)
+        by_id = {n.node_id: n for n in agg.nodes}
+        assert by_id["E0"].dispatch_count == 2
+        assert by_id["E1"].dispatch_count == 1
+        assert by_id["E2"].dispatch_count == 2
+
+    def test_encoder_graph_cross_encoder_edges(self):
+        """Only cross-encoder edges appear."""
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_encoder_graph(nodes, graph)
+        edge_pairs = {(e.source_id, e.target_id) for e in agg.edges}
+        # E0→E1 (via buf 0x200), E1→E2 (via buf 0x300)
+        assert ("E0", "E1") in edge_pairs
+        assert ("E1", "E2") in edge_pairs
+
+    def test_encoder_graph_clusters_by_cb(self):
+        """Encoder graph clusters nodes by command buffer."""
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_encoder_graph(nodes, graph)
+        assert agg.clusters is not None
+        assert agg.cluster_key == "command_buffer"
+        assert "E0" in agg.clusters.get("CB #0", [])
+        assert "E1" in agg.clusters.get("CB #0", [])
+        assert "E2" in agg.clusters.get("CB #1", [])
+
+
+class TestBuildKernelGraph:
+    """Test kernel level aggregation."""
+
+    def test_kernel_graph_nodes(self):
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_kernel_graph(nodes, graph)
+        assert agg.scale == "kernel"
+        assert len(agg.nodes) == 2
+
+    def test_kernel_graph_dispatch_counts(self):
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_kernel_graph(nodes, graph)
+        # kA has 3 dispatches, kB has 2
+        counts = {n.dispatch_count for n in agg.nodes}
+        assert counts == {3, 2}
+
+    def test_kernel_graph_cross_kernel_edges(self):
+        """Cross-kernel edges exist, self-loops don't."""
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_kernel_graph(nodes, graph)
+        for e in agg.edges:
+            assert e.source_id != e.target_id
+        # At least one cross-kernel edge
+        assert len(agg.edges) >= 1
+
+    def test_format_kernel_dot_uses_aggregated(self):
+        """format_kernel_dot delegates to aggregated graph builder."""
+        nodes, graph = _make_multi_cb_nodes()
+        dot = format_kernel_dot(graph)
+        assert "digraph kernel_deps" in dot
+        assert "K0" in dot or "K1" in dot
+
+
+class TestAggregatedDotOutput:
+    """Test DOT formatting for aggregated graphs."""
+
+    def test_cb_dot_renders(self):
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_cb_graph(nodes, graph)
+        dot = format_aggregated_dot(agg, title="test_cb")
+        assert "digraph test_cb" in dot
+        assert "CB0" in dot
+        assert "CB1" in dot
+        assert "CB0 -> CB1" in dot
+
+    def test_encoder_dot_has_clusters(self):
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_encoder_graph(nodes, graph)
+        dot = format_aggregated_dot(agg, title="test_enc")
+        assert "subgraph cluster_" in dot
+        assert "E0" in dot
+        assert "E1" in dot
+
+    def test_kernel_dot_renders(self):
+        nodes, graph = _make_multi_cb_nodes()
+        agg = build_kernel_graph(nodes, graph)
+        dot = format_aggregated_dot(agg, title="test_kernel")
+        assert "digraph test_kernel" in dot
+
+    def test_empty_aggregated_graph(self):
+        agg = AggregatedGraph(nodes=[], edges=[], scale="empty")
+        dot = format_aggregated_dot(agg)
+        assert "digraph" in dot
+
+
+# ---------------------------------------------------------------------------
+# Filter tests
+# ---------------------------------------------------------------------------
+
+class TestApplyFilters:
+    """Test scope filtering of dispatches."""
+
+    def test_filter_by_cb(self):
+        nodes = [
+            _make_node(0, "kA", cb_idx=0),
+            _make_node(1, "kB", cb_idx=1),
+            _make_node(2, "kC", cb_idx=0),
+        ]
+        filtered = _apply_filters(nodes, filter_cb=0)
+        assert len(filtered) == 2
+        assert all(n.command_buffer_idx == 0 for n in filtered)
+        # Re-indexed
+        assert filtered[0].dispatch_id == 0
+        assert filtered[1].dispatch_id == 1
+
+    def test_filter_by_encoder(self):
+        nodes = [
+            _make_node(0, "kA", encoder_idx=0),
+            _make_node(1, "kB", encoder_idx=1),
+            _make_node(2, "kC", encoder_idx=0),
+        ]
+        filtered = _apply_filters(nodes, filter_encoder=1)
+        assert len(filtered) == 1
+        assert filtered[0].kernel == "kB"
+
+    def test_filter_by_kernel_pattern(self):
+        nodes = [
+            _make_node(0, "lu_factor"),
+            _make_node(1, "lu_solve"),
+            _make_node(2, "gemv"),
+        ]
+        filtered = _apply_filters(nodes, filter_kernel="lu_*")
+        assert len(filtered) == 2
+        assert {n.kernel for n in filtered} == {"lu_factor", "lu_solve"}
+
+    def test_combined_filters(self):
+        """Multiple filters are ANDed."""
+        nodes = [
+            _make_node(0, "kA", cb_idx=0, encoder_idx=0),
+            _make_node(1, "kA", cb_idx=0, encoder_idx=1),
+            _make_node(2, "kB", cb_idx=1, encoder_idx=2),
+        ]
+        filtered = _apply_filters(nodes, filter_cb=0, filter_kernel="kA")
+        assert len(filtered) == 2
+
+    def test_empty_result(self):
+        nodes = [_make_node(0, "kA", cb_idx=0)]
+        filtered = _apply_filters(nodes, filter_cb=99)
+        assert len(filtered) == 0

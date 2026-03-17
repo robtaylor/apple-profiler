@@ -102,6 +102,7 @@ class DispatchNode:
     threadgroups: tuple[int, ...] | None = None
     threads_per_threadgroup: tuple[int, ...] | None = None
     command_buffer_idx: int = -1
+    encoder_idx: int = -1
 
 
 @dataclass
@@ -145,10 +146,10 @@ def _import_read_gputrace():
 
 def extract_dispatches(
     trace_data: dict[str, Any],
-) -> tuple[list[DispatchNode], int]:
+) -> tuple[list[DispatchNode], int, int]:
     """Convert timeline events into DispatchNode list.
 
-    Returns (nodes, num_command_buffers).
+    Returns (nodes, num_command_buffers, num_encoders).
     """
     nodes: list[DispatchNode] = []
     dispatch_id = 0
@@ -179,12 +180,14 @@ def extract_dispatches(
             threadgroups=event.get("threadgroups"),
             threads_per_threadgroup=event.get("threads_per_threadgroup"),
             command_buffer_idx=cb_map.get(event["index"], -1),
+            encoder_idx=event.get("encoder_idx", -1),
         )
         nodes.append(node)
         dispatch_id += 1
 
     num_cbs = len(trace_data.get("command_buffers", []))
-    return nodes, num_cbs
+    num_encoders = len(trace_data.get("compute_encoders", []))
+    return nodes, num_cbs, num_encoders
 
 
 # ---------------------------------------------------------------------------
@@ -405,8 +408,28 @@ _DEP_COLORS = {
 def format_dot(
     graph: DependencyGraph,
     cluster_by_cb: bool = True,
+    skip_isolated: bool = True,
 ) -> str:
-    """Format the dependency graph as Graphviz DOT."""
+    """Format the dependency graph as Graphviz DOT.
+
+    Args:
+        graph: The dependency graph to format.
+        cluster_by_cb: Group nodes by command buffer.
+        skip_isolated: Omit nodes with no edges (default True for large graphs).
+    """
+    # Determine which nodes have edges
+    connected_ids: set[int] | None = None
+    if skip_isolated:
+        connected_ids = set()
+        for edge in graph.edges:
+            connected_ids.add(edge.source_id)
+            connected_ids.add(edge.target_id)
+
+    def _include(node: DispatchNode) -> bool:
+        if connected_ids is None:
+            return True
+        return node.dispatch_id in connected_ids
+
     lines = [
         "digraph gpu_deps {",
         '  rankdir=TB;',
@@ -416,20 +439,24 @@ def format_dot(
     ]
 
     if cluster_by_cb:
-        # Group nodes by command buffer
         cb_groups: dict[int, list[DispatchNode]] = defaultdict(list)
         ungrouped: list[DispatchNode] = []
         for node in graph.nodes:
+            if not _include(node):
+                continue
             if node.command_buffer_idx >= 0:
                 cb_groups[node.command_buffer_idx].append(node)
             else:
                 ungrouped.append(node)
 
         for cb_idx in sorted(cb_groups.keys()):
+            nodes_in_cb = cb_groups[cb_idx]
+            if not nodes_in_cb:
+                continue
             lines.append(f"  subgraph cluster_cb{cb_idx} {{")
             lines.append(f'    label="Command Buffer #{cb_idx}";')
             lines.append('    style=dashed; color=gray60;')
-            for node in cb_groups[cb_idx]:
+            for node in nodes_in_cb:
                 lines.append(f"    {_dot_node(node)}")
             lines.append("  }")
             lines.append("")
@@ -438,11 +465,11 @@ def format_dot(
             lines.append(f"  {_dot_node(node)}")
     else:
         for node in graph.nodes:
-            lines.append(f"  {_dot_node(node)}")
+            if _include(node):
+                lines.append(f"  {_dot_node(node)}")
 
     lines.append("")
 
-    # Edges
     for edge in graph.edges:
         color = _DEP_COLORS.get(edge.dep_type, "black")
         label = edge.dep_type.value
@@ -450,6 +477,307 @@ def format_dot(
             f"  D{edge.source_id} -> D{edge.target_id} "
             f'[color={color}, label="{label}", '
             f'tooltip="buf 0x{edge.buffer_addr:x}"];'
+        )
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def format_kernel_dot(graph: DependencyGraph) -> str:
+    """Format a kernel-level summary graph as DOT.
+
+    Collapses all dispatches of the same kernel into a single node,
+    with edge weights showing how many dispatch-level dependencies exist.
+    Much more readable for large traces.
+    """
+    agg = build_kernel_graph(graph.nodes, graph)
+    return format_aggregated_dot(agg, title="kernel_deps")
+
+
+# ---------------------------------------------------------------------------
+# Aggregated graph data model and builders
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AggregatedNode:
+    node_id: str           # "CB0", "E5", "K3"
+    label: str             # "CB #0\n65 dispatches\nlu_gemv(48), lu_solve(17)"
+    dispatch_count: int
+    kernel_composition: dict[str, int]  # kernel → count
+
+    @property
+    def short_composition(self) -> str:
+        """Top kernels as compact string."""
+        top = sorted(self.kernel_composition.items(), key=lambda x: -x[1])[:4]
+        parts = []
+        for k, c in top:
+            name = k if len(k) <= 25 else k[:22] + "..."
+            parts.append(f"{name}({c})")
+        if len(self.kernel_composition) > 4:
+            parts.append("...")
+        return ", ".join(parts)
+
+
+@dataclass
+class AggregatedEdge:
+    source_id: str
+    target_id: str
+    weight: int            # number of dispatch-level edges this represents
+    buffer_addrs: set[int] = field(default_factory=set)
+
+
+@dataclass
+class AggregatedGraph:
+    nodes: list[AggregatedNode] = field(default_factory=list)
+    edges: list[AggregatedEdge] = field(default_factory=list)
+    scale: str = "unknown"
+    cluster_key: str | None = None  # group nodes by this attribute in DOT
+    clusters: dict[str, list[str]] | None = None  # cluster_label → [node_ids]
+
+
+def build_cb_graph(
+    nodes: list[DispatchNode],
+    graph: DependencyGraph,
+) -> AggregatedGraph:
+    """Collapse dependency graph to command buffer level.
+
+    One node per command buffer. Edge between CBs if any dispatch in one
+    shares a buffer dependency with a dispatch in the other.
+    """
+    node_map = {n.dispatch_id: n for n in nodes}
+
+    # Group dispatches by CB
+    cb_dispatches: dict[int, list[DispatchNode]] = defaultdict(list)
+    for n in nodes:
+        cb_dispatches[n.command_buffer_idx].append(n)
+
+    # Build aggregated nodes
+    agg_nodes: dict[str, AggregatedNode] = {}
+    for cb_idx in sorted(cb_dispatches.keys()):
+        dispatches = cb_dispatches[cb_idx]
+        composition: dict[str, int] = defaultdict(int)
+        for d in dispatches:
+            composition[d.kernel] += 1
+        nid = f"CB{cb_idx}"
+        agg_nodes[nid] = AggregatedNode(
+            node_id=nid,
+            label="",  # filled below
+            dispatch_count=len(dispatches),
+            kernel_composition=dict(composition),
+        )
+        node = agg_nodes[nid]
+        node.label = f"CB #{cb_idx}\\n{node.dispatch_count} dispatches\\n{node.short_composition}"
+
+    # Build aggregated edges
+    agg_edges: dict[tuple[str, str], AggregatedEdge] = {}
+    for edge in graph.edges:
+        src_cb = node_map[edge.source_id].command_buffer_idx
+        tgt_cb = node_map[edge.target_id].command_buffer_idx
+        if src_cb == tgt_cb:
+            continue  # skip intra-CB edges
+        key = (f"CB{src_cb}", f"CB{tgt_cb}")
+        if key not in agg_edges:
+            agg_edges[key] = AggregatedEdge(
+                source_id=key[0], target_id=key[1], weight=0,
+            )
+        agg_edges[key].weight += 1
+        agg_edges[key].buffer_addrs.add(edge.buffer_addr)
+
+    return AggregatedGraph(
+        nodes=list(agg_nodes.values()),
+        edges=list(agg_edges.values()),
+        scale="cb",
+    )
+
+
+def build_encoder_graph(
+    nodes: list[DispatchNode],
+    graph: DependencyGraph,
+) -> AggregatedGraph:
+    """Collapse dependency graph to compute encoder level.
+
+    One node per encoder. Clustered by command buffer.
+    """
+    node_map = {n.dispatch_id: n for n in nodes}
+
+    # Group dispatches by encoder
+    enc_dispatches: dict[int, list[DispatchNode]] = defaultdict(list)
+    for n in nodes:
+        enc_dispatches[n.encoder_idx].append(n)
+
+    # Build aggregated nodes
+    agg_nodes: dict[str, AggregatedNode] = {}
+    enc_to_cb: dict[str, int] = {}
+    for enc_idx in sorted(enc_dispatches.keys()):
+        dispatches = enc_dispatches[enc_idx]
+        composition: dict[str, int] = defaultdict(int)
+        for d in dispatches:
+            composition[d.kernel] += 1
+        nid = f"E{enc_idx}"
+        cb_idx = dispatches[0].command_buffer_idx if dispatches else -1
+        enc_to_cb[nid] = cb_idx
+        agg_nodes[nid] = AggregatedNode(
+            node_id=nid,
+            label="",
+            dispatch_count=len(dispatches),
+            kernel_composition=dict(composition),
+        )
+        node = agg_nodes[nid]
+        comp = node.short_composition
+        node.label = f"Encoder #{enc_idx}\\n{node.dispatch_count} dispatches\\n{comp}"
+
+    # Build aggregated edges
+    agg_edges: dict[tuple[str, str], AggregatedEdge] = {}
+    for edge in graph.edges:
+        src_enc = node_map[edge.source_id].encoder_idx
+        tgt_enc = node_map[edge.target_id].encoder_idx
+        if src_enc == tgt_enc:
+            continue
+        key = (f"E{src_enc}", f"E{tgt_enc}")
+        if key not in agg_edges:
+            agg_edges[key] = AggregatedEdge(
+                source_id=key[0], target_id=key[1], weight=0,
+            )
+        agg_edges[key].weight += 1
+        agg_edges[key].buffer_addrs.add(edge.buffer_addr)
+
+    # Build clusters by command buffer
+    clusters: dict[str, list[str]] = defaultdict(list)
+    for nid, cb_idx in enc_to_cb.items():
+        clusters[f"CB #{cb_idx}"].append(nid)
+
+    return AggregatedGraph(
+        nodes=list(agg_nodes.values()),
+        edges=list(agg_edges.values()),
+        scale="encoder",
+        cluster_key="command_buffer",
+        clusters=dict(clusters),
+    )
+
+
+def build_kernel_graph(
+    nodes: list[DispatchNode],
+    graph: DependencyGraph,
+) -> AggregatedGraph:
+    """Collapse dependency graph to kernel level.
+
+    One node per unique kernel name. Self-loops (intra-kernel deps) counted
+    but not drawn as edges.
+    """
+    node_map = {n.dispatch_id: n for n in nodes}
+
+    # Aggregate dispatches by kernel
+    kernel_dispatches: dict[str, list[DispatchNode]] = defaultdict(list)
+    for n in nodes:
+        kernel_dispatches[n.kernel].append(n)
+
+    # Self-loop count
+    self_deps: dict[str, int] = defaultdict(int)
+    for edge in graph.edges:
+        src_k = node_map[edge.source_id].kernel
+        tgt_k = node_map[edge.target_id].kernel
+        if src_k == tgt_k:
+            self_deps[src_k] += 1
+
+    agg_nodes: dict[str, AggregatedNode] = {}
+    kernels = sorted(kernel_dispatches.keys())
+    for i, kernel in enumerate(kernels):
+        dispatches = kernel_dispatches[kernel]
+        nid = f"K{i}"
+        name = kernel if len(kernel) <= 40 else kernel[:37] + "..."
+        self_count = self_deps.get(kernel, 0)
+        self_str = f"\\nself-deps={self_count}" if self_count else ""
+        agg_nodes[kernel] = AggregatedNode(
+            node_id=nid,
+            label=f"{name}\\ndispatches={len(dispatches)}{self_str}",
+            dispatch_count=len(dispatches),
+            kernel_composition={kernel: len(dispatches)},
+        )
+
+    # Map kernel name → node_id for edges
+    kernel_to_nid = {k: agg_nodes[k].node_id for k in kernels}
+
+    agg_edges: dict[tuple[str, str], AggregatedEdge] = {}
+    for edge in graph.edges:
+        src_k = node_map[edge.source_id].kernel
+        tgt_k = node_map[edge.target_id].kernel
+        if src_k == tgt_k:
+            continue
+        key = (kernel_to_nid[src_k], kernel_to_nid[tgt_k])
+        if key not in agg_edges:
+            agg_edges[key] = AggregatedEdge(
+                source_id=key[0], target_id=key[1], weight=0,
+            )
+        agg_edges[key].weight += 1
+        agg_edges[key].buffer_addrs.add(edge.buffer_addr)
+
+    return AggregatedGraph(
+        nodes=list(agg_nodes.values()),
+        edges=list(agg_edges.values()),
+        scale="kernel",
+    )
+
+
+def format_aggregated_dot(
+    agg: AggregatedGraph,
+    title: str = "gpu_deps",
+) -> str:
+    """Format an aggregated graph as Graphviz DOT.
+
+    Node width proportional to dispatch count. Edge penwidth proportional
+    to weight. Clusters if available.
+    """
+    lines = [
+        f"digraph {title} {{",
+        '  rankdir=TB;',
+        '  node [shape=box, style="rounded,filled", fillcolor=lightyellow, fontsize=11];',
+        '  edge [fontsize=9];',
+        "",
+    ]
+
+    # Max dispatch count for sizing
+    max_count = max((n.dispatch_count for n in agg.nodes), default=1)
+
+    def _node_line(node: AggregatedNode) -> str:
+        # Scale width 1.5..4 based on dispatch count
+        width = 1.5 + 2.5 * (node.dispatch_count / max(max_count, 1))
+        return (
+            f'  {node.node_id} [label="{node.label}", '
+            f'width={width:.1f}];'
+        )
+
+    if agg.clusters:
+        # Emit clustered nodes
+        emitted: set[str] = set()
+        for i, (cluster_label, node_ids) in enumerate(
+            sorted(agg.clusters.items())
+        ):
+            lines.append(f"  subgraph cluster_{i} {{")
+            lines.append(f'    label="{cluster_label}";')
+            lines.append('    style=dashed; color=gray60;')
+            for node in agg.nodes:
+                if node.node_id in node_ids:
+                    lines.append(f"  {_node_line(node)}")
+                    emitted.add(node.node_id)
+            lines.append("  }")
+            lines.append("")
+        # Emit unclustered nodes
+        for node in agg.nodes:
+            if node.node_id not in emitted:
+                lines.append(_node_line(node))
+    else:
+        for node in agg.nodes:
+            lines.append(_node_line(node))
+
+    lines.append("")
+
+    for edge in sorted(agg.edges, key=lambda e: -e.weight):
+        pw = min(1 + edge.weight / 50, 5)
+        bufs = len(edge.buffer_addrs)
+        lines.append(
+            f'  {edge.source_id} -> {edge.target_id} '
+            f'[label="{edge.weight}", penwidth={pw:.1f}, '
+            f'tooltip="{bufs} shared buffers"];'
         )
 
     lines.append("}")
@@ -497,6 +825,7 @@ def format_json(graph: DependencyGraph) -> dict[str, Any]:
                 for b in node.buffers
             ],
             "command_buffer": node.command_buffer_idx,
+            "encoder": node.encoder_idx,
         }
         if node.threadgroups:
             n["threadgroups"] = list(node.threadgroups)
@@ -583,7 +912,7 @@ def print_summary(graph: DependencyGraph, num_cbs: int) -> None:
     data = format_json(graph)
     s = data["summary"]
 
-    print(f"\n=== Dependency Graph Summary ===")
+    print("\n=== Dependency Graph Summary ===")
     print(f"Dispatches:          {s['total_dispatches']}")
     print(f"Dependency edges:    {s['total_edges']}")
     print(f"Edge types:          {s['edge_types']}")
@@ -612,7 +941,7 @@ def print_summary(graph: DependencyGraph, num_cbs: int) -> None:
         kernel_edge_out[src_kernel] += 1
         kernel_edge_in[tgt_kernel] += 1
 
-    print(f"\nPer-kernel breakdown:")
+    print("\nPer-kernel breakdown:")
     print(f"  {'Kernel':<45s} {'Count':>6s} {'In':>6s} {'Out':>6s}")
     print(f"  {'-' * 45} {'-' * 6} {'-' * 6} {'-' * 6}")
     for kernel in sorted(kernel_dispatch_count, key=lambda k: -kernel_dispatch_count[k]):
@@ -634,7 +963,7 @@ def print_summary(graph: DependencyGraph, num_cbs: int) -> None:
         max_out = max((out_deg.get(n.dispatch_id, 0) for n in graph.nodes), default=0)
         avg_in = sum(in_deg.values()) / len(graph.nodes)
         avg_out = sum(out_deg.values()) / len(graph.nodes)
-        print(f"\nDegree stats:")
+        print("\nDegree stats:")
         print(f"  Max in-degree:  {max_in}")
         print(f"  Max out-degree: {max_out}")
         print(f"  Avg in-degree:  {avg_in:.1f}")
@@ -644,6 +973,9 @@ def print_summary(graph: DependencyGraph, num_cbs: int) -> None:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+_MAX_UNSCOPED_DISPATCHES = 2000
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -664,6 +996,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "-o", "--output",
         help="Output path (without extension for 'both' format)",
+    )
+    p.add_argument(
+        "--scale",
+        choices=["dispatch", "encoder", "kernel", "cb"],
+        default="encoder",
+        help="Graph scale: cb, encoder, kernel, or dispatch (default: encoder)",
     )
     p.add_argument(
         "--conservative",
@@ -690,7 +1028,55 @@ def parse_args() -> argparse.Namespace:
         "--filter-kernel",
         help="Only include dispatches matching this glob pattern",
     )
+    p.add_argument(
+        "--filter-cb",
+        type=int,
+        help="Only include dispatches in this command buffer index",
+    )
+    p.add_argument(
+        "--filter-encoder",
+        type=int,
+        help="Only include dispatches in this encoder index",
+    )
+    p.add_argument(
+        "--include-isolated",
+        action="store_true",
+        help="Include isolated nodes (no edges) in DOT output",
+    )
     return p.parse_args()
+
+
+def _apply_filters(
+    nodes: list[DispatchNode],
+    filter_kernel: str | None = None,
+    filter_cb: int | None = None,
+    filter_encoder: int | None = None,
+) -> list[DispatchNode]:
+    """Apply scope filters and re-index dispatch IDs."""
+    filtered = nodes
+
+    if filter_cb is not None:
+        filtered = [n for n in filtered if n.command_buffer_idx == filter_cb]
+        log.info("CB filter %d: %d/%d dispatches", filter_cb, len(filtered), len(nodes))
+
+    if filter_encoder is not None:
+        filtered = [n for n in filtered if n.encoder_idx == filter_encoder]
+        log.info("Encoder filter %d: %d/%d dispatches", filter_encoder, len(filtered), len(nodes))
+
+    if filter_kernel:
+        filtered = [n for n in filtered if fnmatch.fnmatch(n.kernel, filter_kernel)]
+        log.info("Kernel filter '%s': %d/%d dispatches", filter_kernel, len(filtered), len(nodes))
+
+    # Re-index dispatch IDs for the filtered subset
+    for i, n in enumerate(filtered):
+        n.dispatch_id = i
+
+    return filtered
+
+
+def _scale_suffix(scale: str) -> str:
+    """Return filename suffix for the given scale."""
+    return {"cb": "_cb", "encoder": "_encoder", "kernel": "_kernel", "dispatch": ""}[scale]
 
 
 def main() -> None:
@@ -707,29 +1093,41 @@ def main() -> None:
         sys.exit(1)
 
     # Extract dispatches
-    nodes, num_cbs = extract_dispatches(trace_data)
-    log.info("Extracted %d dispatches from %d command buffers", len(nodes), num_cbs)
+    nodes, num_cbs, num_encoders = extract_dispatches(trace_data)
+    log.info(
+        "Extracted %d dispatches from %d command buffers, %d encoders",
+        len(nodes), num_cbs, num_encoders,
+    )
 
     if not nodes:
         log.warning("No dispatches found in trace")
         sys.exit(0)
 
-    # Apply kernel filter
-    if args.filter_kernel:
-        pattern = args.filter_kernel
-        filtered = [n for n in nodes if fnmatch.fnmatch(n.kernel, pattern)]
-        log.info(
-            "Kernel filter '%s': %d/%d dispatches",
-            pattern, len(filtered), len(nodes),
+    # Apply scope filters
+    has_filter = (
+        args.filter_kernel is not None
+        or args.filter_cb is not None
+        or args.filter_encoder is not None
+    )
+    nodes = _apply_filters(
+        nodes,
+        filter_kernel=args.filter_kernel,
+        filter_cb=args.filter_cb,
+        filter_encoder=args.filter_encoder,
+    )
+
+    if not nodes:
+        log.warning("No dispatches after filtering")
+        sys.exit(0)
+
+    # Guard against unscoped dispatch-level graphs
+    if args.scale == "dispatch" and not has_filter and len(nodes) > _MAX_UNSCOPED_DISPATCHES:
+        log.error(
+            "Dispatch-level graph has %d nodes (threshold: %d). "
+            "Use --filter-cb, --filter-encoder, or --filter-kernel to scope.",
+            len(nodes), _MAX_UNSCOPED_DISPATCHES,
         )
-        # Re-index filtered nodes
-        id_map = {n.dispatch_id: i for i, n in enumerate(filtered)}
-        for i, n in enumerate(filtered):
-            n.dispatch_id = i
-        for n in filtered:
-            # Remap buffer bindings stay the same
-            pass
-        nodes = filtered
+        sys.exit(1)
 
     # Build dependency graph
     graph = build_dependency_graph(nodes, conservative=args.conservative)
@@ -755,15 +1153,60 @@ def main() -> None:
     else:
         base = Path(args.trace_path).with_suffix("")
 
+    # Build graph at requested scale
+    scale = args.scale
+    suffix = _scale_suffix(scale)
+
+    if scale == "cb":
+        agg = build_cb_graph(nodes, graph)
+        dot_content = format_aggregated_dot(agg, title="cb_deps")
+    elif scale == "encoder":
+        agg = build_encoder_graph(nodes, graph)
+        dot_content = format_aggregated_dot(agg, title="encoder_deps")
+    elif scale == "kernel":
+        agg = build_kernel_graph(nodes, graph)
+        dot_content = format_aggregated_dot(agg, title="kernel_deps")
+    elif scale == "dispatch":
+        dot_content = format_dot(
+            graph,
+            cluster_by_cb=not args.no_cluster,
+            skip_isolated=not args.include_isolated,
+        )
+        agg = None
+    else:
+        assert False, f"Unknown scale: {scale}"
+
     # Output DOT
     if args.format in ("dot", "both"):
         dot_path = base.with_suffix(".dot") if args.format == "both" else base
         if args.format == "dot" and not str(dot_path).endswith(".dot"):
             dot_path = dot_path.with_suffix(".dot")
-        dot_content = format_dot(graph, cluster_by_cb=not args.no_cluster)
+        if suffix:
+            dot_path = dot_path.with_stem(dot_path.stem + suffix)
+
         dot_path.write_text(dot_content)
-        log.info("DOT written to: %s", dot_path)
-        log.info("Render with: dot -Tsvg %s -o %s", dot_path, dot_path.with_suffix(".svg"))
+        log.info("DOT written to: %s (%s scale)", dot_path, scale)
+
+        # Suggest layout engine
+        if agg is not None:
+            n_nodes = len(agg.nodes)
+        else:
+            n_nodes = sum(
+                1 for n in graph.nodes
+                if any(e.source_id == n.dispatch_id or e.target_id == n.dispatch_id
+                       for e in graph.edges)
+            )
+
+        if n_nodes > 500:
+            log.info(
+                "Large graph (%d nodes). Use sfdp: sfdp -Tsvg %s -o %s",
+                n_nodes, dot_path, dot_path.with_suffix(".svg"),
+            )
+        else:
+            log.info(
+                "Render: dot -Tsvg %s -o %s",
+                dot_path, dot_path.with_suffix(".svg"),
+            )
 
     # Output JSON
     if args.format in ("json", "both"):
@@ -771,6 +1214,27 @@ def main() -> None:
         if args.format == "json" and not str(json_path).endswith(".json"):
             json_path = json_path.with_suffix(".json")
         json_data = format_json(graph)
+        json_data["scale"] = scale
+        if agg is not None:
+            json_data["aggregated"] = {
+                "nodes": [
+                    {
+                        "id": n.node_id,
+                        "dispatch_count": n.dispatch_count,
+                        "kernel_composition": n.kernel_composition,
+                    }
+                    for n in agg.nodes
+                ],
+                "edges": [
+                    {
+                        "source": e.source_id,
+                        "target": e.target_id,
+                        "weight": e.weight,
+                        "shared_buffers": len(e.buffer_addrs),
+                    }
+                    for e in agg.edges
+                ],
+            }
         json_path.write_text(json.dumps(json_data, indent=2))
         log.info("JSON written to: %s", json_path)
 
