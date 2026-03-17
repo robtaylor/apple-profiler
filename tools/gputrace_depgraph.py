@@ -1156,7 +1156,10 @@ _HTML_TEMPLATE = """\
 <body>
 <div id="controls">
   <button id="fit-btn" title="Fit to screen">Fit</button>
-  <input id="filter-input" type="text" placeholder="Filter by kernel name..." />
+  <input id="search-input" type="text" placeholder="Search (kernel, address, ID)..." />
+  <span id="search-count" style="font-size:12px;min-width:50px"></span>
+  <button id="search-prev" title="Previous match" style="display:none">&uarr;</button>
+  <button id="search-next" title="Next match" style="display:none">&darr;</button>
   <select id="layout-select">
     <option value="tidytree">Tidy Tree</option>
     <option value="dagre">Dagre (DAG)</option>
@@ -1290,11 +1293,42 @@ const cy = cytoscape({{
 // --- Controls ---
 document.getElementById('fit-btn').addEventListener('click', () => cy.fit(null, 40));
 
-document.getElementById('filter-input').addEventListener('input', (e) => {{
-  const q = e.target.value.toLowerCase();
+// --- Search ---
+let searchMatches = [];
+let searchIdx = -1;
+
+function nodeSearchText(n) {{
+  const d = n.data();
+  const parts = [d.id || '', d.label || '', d.kernel || ''];
+  if (d.cb !== undefined && d.cb >= 0) parts.push('CB#' + d.cb, 'CB #' + d.cb);
+  if (d.encoder !== undefined && d.encoder >= 0) parts.push('E#' + d.encoder, 'Encoder #' + d.encoder);
+  if (d.composition) {{
+    for (const k of Object.keys(d.composition)) parts.push(k);
+  }}
+  return parts.join(' ').toLowerCase();
+}}
+
+function doSearch(q) {{
+  searchMatches = [];
+  searchIdx = -1;
+  const countEl = document.getElementById('search-count');
+  const prevBtn = document.getElementById('search-prev');
+  const nextBtn = document.getElementById('search-next');
+
+  if (!q) {{
+    cy.nodes().style('opacity', 1);
+    cy.edges().style('opacity', 1);
+    countEl.textContent = '';
+    prevBtn.style.display = 'none';
+    nextBtn.style.display = 'none';
+    return;
+  }}
+
   cy.nodes().forEach(n => {{
-    const kernelData = (n.data('kernel') || n.data('label') || '').toLowerCase();
-    if (!q || kernelData.includes(q)) {{
+    if (n.isParent()) return;
+    const text = nodeSearchText(n);
+    if (text.includes(q)) {{
+      searchMatches.push(n);
       n.style('opacity', 1);
       n.connectedEdges().style('opacity', 1);
     }} else {{
@@ -1302,7 +1336,47 @@ document.getElementById('filter-input').addEventListener('input', (e) => {{
       n.connectedEdges().style('opacity', 0.08);
     }}
   }});
+
+  const count = searchMatches.length;
+  countEl.textContent = count ? count + ' found' : 'no matches';
+  prevBtn.style.display = count > 1 ? 'inline-block' : 'none';
+  nextBtn.style.display = count > 1 ? 'inline-block' : 'none';
+
+  if (count === 1) {{
+    cy.animate({{ center: searchMatches[0].position(), zoom: Math.max(cy.zoom(), 0.8), duration: 300 }});
+    searchMatches[0].select();
+    searchIdx = 0;
+  }} else if (count > 1) {{
+    jumpToMatch(0);
+  }}
+}}
+
+function jumpToMatch(idx) {{
+  if (!searchMatches.length) return;
+  searchIdx = ((idx % searchMatches.length) + searchMatches.length) % searchMatches.length;
+  const node = searchMatches[searchIdx];
+  cy.nodes().unselect();
+  node.select();
+  cy.animate({{ center: node.position(), zoom: Math.max(cy.zoom(), 0.8), duration: 200 }});
+  document.getElementById('search-count').textContent =
+    (searchIdx + 1) + '/' + searchMatches.length;
+}}
+
+document.getElementById('search-input').addEventListener('input', (e) => {{
+  doSearch(e.target.value.toLowerCase());
 }});
+document.getElementById('search-input').addEventListener('keydown', (e) => {{
+  if (e.key === 'Enter') {{
+    e.preventDefault();
+    jumpToMatch(e.shiftKey ? searchIdx - 1 : searchIdx + 1);
+  }} else if (e.key === 'Escape') {{
+    e.target.value = '';
+    doSearch('');
+    e.target.blur();
+  }}
+}});
+document.getElementById('search-prev').addEventListener('click', () => jumpToMatch(searchIdx - 1));
+document.getElementById('search-next').addEventListener('click', () => jumpToMatch(searchIdx + 1));
 
 const LAYOUTS = {{
   tidytree: {{ name: 'tidytree', direction: 'TB', horizontalSpacing: 40, verticalSpacing: 60 }},
