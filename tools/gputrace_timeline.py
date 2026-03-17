@@ -474,6 +474,25 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
 
         func_idx += 1
 
+    # Flush any open encoder
+    if current_encoder_dispatches:
+        cb_idx = active_cbs[current_cb_addr]["cb_idx"] if current_cb_addr in active_cbs else -1
+        compute_encoders.append({
+            "encoder_idx": current_encoder_idx,
+            "command_buffer_idx": cb_idx,
+            "addr": current_encoder_addr,
+            "dispatches": list(current_encoder_dispatches),
+        })
+
+    # Flush uncommitted CBs (stream may end before final commits)
+    for cb_addr, cb_info in active_cbs.items():
+        if cb_info["dispatches"]:
+            command_buffers.append({
+                "func_idx": -1,  # no commit event
+                "addr": cb_info["addr"],
+                "dispatches": cb_info["dispatches"],
+            })
+
     return {
         "metadata": metadata,
         "total_functions": func_idx,
@@ -535,16 +554,19 @@ def main() -> None:
 
     print(f"\nCompute encoders: {len(result['compute_encoders'])}")
     for i, enc in enumerate(result["compute_encoders"][:10]):
+        addr = enc.get('addr', '')
+        addr_str = f" {addr}" if addr else ""
         print(
-            f"  Encoder#{enc['encoder_idx']}: {len(enc['dispatches'])} dispatches "
+            f"  Encoder#{enc['encoder_idx']}{addr_str}: {len(enc['dispatches'])} dispatches "
             f"(CB#{enc['command_buffer_idx']})"
         )
 
     print(f"\nCommand buffers: {len(result['command_buffers'])}")
     for i, cb in enumerate(result["command_buffers"][:10]):
+        addr = cb.get('addr', '')
+        addr_str = f" {addr}" if addr else ""
         print(
-            f"  CB#{i}: {len(cb['dispatches'])} dispatches "
-            f"(func #{cb['func_idx']})"
+            f"  CB#{i}{addr_str}: {len(cb['dispatches'])} dispatches"
         )
         cb_kernels: dict[str, int] = defaultdict(int)
         for d in cb["dispatches"]:

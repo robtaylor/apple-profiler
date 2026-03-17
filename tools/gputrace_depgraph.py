@@ -549,6 +549,7 @@ def format_dot(
     cluster_by_cb: bool = True,
     skip_isolated: bool = True,
     barriers: list[BarrierNode] | None = None,
+    cb_addrs: dict[int, str] | None = None,
 ) -> str:
     """Format the dependency graph as Graphviz DOT.
 
@@ -557,7 +558,9 @@ def format_dot(
         cluster_by_cb: Group nodes by command buffer.
         skip_isolated: Omit nodes with no edges (default True for large graphs).
         barriers: Optional barrier nodes to render as diamonds.
+        cb_addrs: Command buffer index → hex address mapping.
     """
+    _cb_addrs = cb_addrs or {}
     # Determine which nodes have edges
     connected_ids: set[int] | None = None
     if skip_isolated:
@@ -595,7 +598,10 @@ def format_dot(
             if not nodes_in_cb:
                 continue
             lines.append(f"  subgraph cluster_cb{cb_idx} {{")
-            lines.append(f'    label="Command Buffer #{cb_idx}";')
+            cb_label = f"Command Buffer #{cb_idx}"
+            if cb_idx in _cb_addrs:
+                cb_label += f" ({_cb_addrs[cb_idx]})"
+            lines.append(f'    label="{cb_label}";')
             lines.append('    style=dashed; color=gray60;')
             for node in nodes_in_cb:
                 lines.append(f"    {_dot_node(node)}")
@@ -1524,17 +1530,22 @@ document.getElementById('layout-select').addEventListener('change', () => {{
 def _dispatch_graph_to_cytoscape(
     graph: DependencyGraph,
     barriers: list[BarrierNode] | None = None,
+    cb_addrs: dict[int, str] | None = None,
 ) -> dict[str, Any]:
     """Convert a dispatch-level DependencyGraph to Cytoscape.js elements."""
     elements: list[dict[str, Any]] = []
+    _cb_addrs = cb_addrs or {}
 
     # Compound parent nodes for command buffer clusters
     cb_indices = sorted({n.command_buffer_idx for n in graph.nodes if n.command_buffer_idx >= 0})
     for cb_idx in cb_indices:
+        label = f"Command Buffer #{cb_idx}"
+        if cb_idx in _cb_addrs:
+            label += f" ({_cb_addrs[cb_idx]})"
         elements.append({
             "data": {
                 "id": f"cb_group_{cb_idx}",
-                "label": f"Command Buffer #{cb_idx}",
+                "label": label,
                 "type": "cluster",
             },
         })
@@ -1705,6 +1716,7 @@ def format_html(
     scale: str,
     agg: AggregatedGraph | None = None,
     barriers: list[BarrierNode] | None = None,
+    cb_addrs: dict[int, str] | None = None,
     title: str = "GPU Dependency Graph",
 ) -> str:
     """Format the dependency graph as a self-contained interactive HTML file.
@@ -1716,10 +1728,13 @@ def format_html(
         scale: Graph scale ("dispatch", "encoder", "cb", "kernel").
         agg: Pre-built aggregated graph (for encoder/cb/kernel scales).
         barriers: Barrier nodes for dispatch-level rendering.
+        cb_addrs: Command buffer index → hex address mapping.
         title: Page title.
     """
     if scale == "dispatch":
-        cyto_data = _dispatch_graph_to_cytoscape(graph, barriers=barriers)
+        cyto_data = _dispatch_graph_to_cytoscape(
+            graph, barriers=barriers, cb_addrs=cb_addrs,
+        )
     else:
         assert agg is not None, f"Aggregated graph required for scale={scale}"
         cyto_data = _aggregated_to_cytoscape(agg)
@@ -2059,6 +2074,7 @@ def main() -> None:
             cluster_by_cb=not args.no_cluster,
             skip_isolated=not args.include_isolated,
             barriers=barriers if barriers else None,
+            cb_addrs=meta.cb_addrs,
         )
         agg = None
     else:
@@ -2137,6 +2153,7 @@ def main() -> None:
         html_content = format_html(
             graph, scale=scale, agg=agg,
             barriers=barriers if barriers else None,
+            cb_addrs=meta.cb_addrs,
             title=Path(args.trace_path).stem,
         )
         html_path.write_text(html_content)
