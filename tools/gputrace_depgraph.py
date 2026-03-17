@@ -106,6 +106,20 @@ class DispatchNode:
 
 
 @dataclass
+class BarrierNode:
+    """A memory barrier synchronization point within an encoder.
+
+    Barriers enforce ordering: all dispatches before the barrier in the same
+    encoder must complete before any dispatch after it can begin.
+    """
+    barrier_id: int
+    scope: str              # "buffers" or "resources"
+    encoder_idx: int = -1
+    command_buffer_idx: int = -1
+    after_dispatch_id: int = -1  # last dispatch before this barrier
+
+
+@dataclass
 class DependencyEdge:
     source_id: int
     target_id: int
@@ -146,18 +160,18 @@ def _import_read_gputrace():
 
 def extract_dispatches(
     trace_data: dict[str, Any],
-) -> tuple[list[DispatchNode], int, int]:
-    """Convert timeline events into DispatchNode list.
+) -> tuple[list[DispatchNode], list[BarrierNode], int, int]:
+    """Convert timeline events into DispatchNode and BarrierNode lists.
 
-    Returns (nodes, num_command_buffers, num_encoders).
+    Returns (dispatch_nodes, barrier_nodes, num_command_buffers, num_encoders).
 
-    Note: Memory barrier events ("type": "barrier") are intentionally filtered out
-    here. Barriers are synchronization points but do not consume GPU compute resources.
-    In a future version, barriers may be represented as separate BarrierNode objects
-    in the dependency graph to model their synchronization semantics.
+    Barriers are synchronization points: all dispatches before a barrier in the
+    same encoder must complete before any dispatch after the barrier can start.
     """
     nodes: list[DispatchNode] = []
+    barriers: list[BarrierNode] = []
     dispatch_id = 0
+    barrier_id = 0
 
     # Build a dispatch_func_idx → command_buffer_idx mapping
     cb_map: dict[int, int] = {}
@@ -165,34 +179,52 @@ def extract_dispatches(
         for d in cb.get("dispatches", []):
             cb_map[d["index"]] = cb_idx
 
+    # Track the last dispatch_id per encoder (for barrier placement)
+    last_dispatch_in_encoder: dict[int, int] = {}
+
     for event in trace_data.get("events", []):
-        if event.get("type") != "dispatch":
-            continue
+        etype = event.get("type")
 
-        buffers = []
-        for buf_index, buf_addr in event.get("buffers_bound", {}).items():
-            buffers.append(BufferBinding(
-                buffer_addr=buf_addr,
-                buffer_index=int(buf_index),
-                access_mode=AccessMode.UNKNOWN,
+        if etype == "dispatch":
+            buffers = []
+            for buf_index, buf_addr in event.get("buffers_bound", {}).items():
+                buffers.append(BufferBinding(
+                    buffer_addr=buf_addr,
+                    buffer_index=int(buf_index),
+                    access_mode=AccessMode.UNKNOWN,
+                ))
+
+            enc_idx = event.get("encoder_idx", -1)
+            node = DispatchNode(
+                dispatch_id=dispatch_id,
+                func_idx=event["index"],
+                kernel=event.get("kernel", "unknown"),
+                buffers=buffers,
+                threadgroups=event.get("threadgroups"),
+                threads_per_threadgroup=event.get("threads_per_threadgroup"),
+                command_buffer_idx=cb_map.get(event["index"], -1),
+                encoder_idx=enc_idx,
+            )
+            nodes.append(node)
+            last_dispatch_in_encoder[enc_idx] = dispatch_id
+            dispatch_id += 1
+
+        elif etype == "barrier":
+            enc_idx = event.get("encoder_idx", -1)
+            scope = event.get("scope", "buffers")
+            after_did = last_dispatch_in_encoder.get(enc_idx, -1)
+            barriers.append(BarrierNode(
+                barrier_id=barrier_id,
+                scope=scope,
+                encoder_idx=enc_idx,
+                command_buffer_idx=event.get("command_buffer_idx", -1),
+                after_dispatch_id=after_did,
             ))
-
-        node = DispatchNode(
-            dispatch_id=dispatch_id,
-            func_idx=event["index"],
-            kernel=event.get("kernel", "unknown"),
-            buffers=buffers,
-            threadgroups=event.get("threadgroups"),
-            threads_per_threadgroup=event.get("threads_per_threadgroup"),
-            command_buffer_idx=cb_map.get(event["index"], -1),
-            encoder_idx=event.get("encoder_idx", -1),
-        )
-        nodes.append(node)
-        dispatch_id += 1
+            barrier_id += 1
 
     num_cbs = len(trace_data.get("command_buffers", []))
     num_encoders = len(trace_data.get("compute_encoders", []))
-    return nodes, num_cbs, num_encoders
+    return nodes, barriers, num_cbs, num_encoders
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +234,7 @@ def extract_dispatches(
 def build_dependency_graph(
     nodes: list[DispatchNode],
     conservative: bool = True,
+    barriers: list[BarrierNode] | None = None,
 ) -> DependencyGraph:
     """Build a dependency DAG from buffer hazard analysis.
 
@@ -210,16 +243,27 @@ def build_dependency_graph(
 
     When access modes are available (future), creates RAW/WAW/WAR edges.
 
+    If barriers are provided, they act as synchronization points within each
+    encoder: every dispatch before a barrier must complete before every
+    dispatch after it (within the same encoder).
+
     Args:
         nodes: Dispatches in trace order.
         conservative: If True, treat all buffer accesses as read-write.
+        barriers: Optional barrier nodes from extract_dispatches().
     """
     graph = DependencyGraph(nodes=nodes)
 
     if conservative:
-        return _build_conservative(graph, nodes)
+        graph = _build_conservative(graph, nodes)
     else:
-        return _build_hazard_based(graph, nodes)
+        graph = _build_hazard_based(graph, nodes)
+
+    # Apply barrier-induced ordering
+    if barriers:
+        _apply_barrier_edges(graph, nodes, barriers)
+
+    return graph
 
 
 def _build_conservative(
@@ -311,6 +355,67 @@ def _build_hazard_based(
                 readers_since_write[addr].add(node.dispatch_id)
 
     return graph
+
+
+def _apply_barrier_edges(
+    graph: DependencyGraph,
+    nodes: list[DispatchNode],
+    barriers: list[BarrierNode],
+) -> None:
+    """Add edges enforced by memory barriers.
+
+    A barrier between dispatch A and dispatch B within the same encoder means
+    A must complete before B starts. For each barrier, we find the dispatches
+    before and after it in the same encoder, and ensure the last dispatch before
+    the barrier has an edge to the first dispatch after it.
+
+    This is more precise than connecting all pre-barrier to all post-barrier:
+    buffer-based edges already handle the transitive cases, and adding just
+    the "last before → first after" edge per barrier is sufficient since
+    transitive reduction will handle the rest.
+    """
+    # Group dispatches by encoder, preserving dispatch_id order
+    enc_dispatches: dict[int, list[int]] = defaultdict(list)
+    for node in nodes:
+        enc_dispatches[node.encoder_idx].append(node.dispatch_id)
+
+    # Track existing edges to avoid duplicates
+    existing_edges: set[tuple[int, int]] = set()
+    for edge in graph.edges:
+        existing_edges.add((edge.source_id, edge.target_id))
+
+    for barrier in barriers:
+        enc_idx = barrier.encoder_idx
+        dispatches_in_enc = enc_dispatches.get(enc_idx, [])
+        if not dispatches_in_enc:
+            continue
+
+        # Split dispatches into before and after the barrier.
+        # barrier.after_dispatch_id is the last dispatch before the barrier.
+        split = barrier.after_dispatch_id
+        if split < 0:
+            # Barrier before any dispatch in this encoder — no ordering to enforce
+            continue
+
+        before = [d for d in dispatches_in_enc if d <= split]
+        after = [d for d in dispatches_in_enc if d > split]
+
+        if not before or not after:
+            continue
+
+        # Add edge from last dispatch before barrier to first dispatch after.
+        # Buffer-based edges + transitive reduction handle the rest.
+        last_before = before[-1]
+        first_after = after[0]
+
+        if (last_before, first_after) not in existing_edges:
+            graph.add_edge(DependencyEdge(
+                source_id=last_before,
+                target_id=first_after,
+                dep_type=DepType.SHARED,
+                buffer_addr=0,  # barrier-induced, no specific buffer
+            ))
+            existing_edges.add((last_before, first_after))
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +519,7 @@ def format_dot(
     graph: DependencyGraph,
     cluster_by_cb: bool = True,
     skip_isolated: bool = True,
+    barriers: list[BarrierNode] | None = None,
 ) -> str:
     """Format the dependency graph as Graphviz DOT.
 
@@ -421,6 +527,7 @@ def format_dot(
         graph: The dependency graph to format.
         cluster_by_cb: Group nodes by command buffer.
         skip_isolated: Omit nodes with no edges (default True for large graphs).
+        barriers: Optional barrier nodes to render as diamonds.
     """
     # Determine which nodes have edges
     connected_ids: set[int] | None = None
@@ -473,16 +580,60 @@ def format_dot(
             if _include(node):
                 lines.append(f"  {_dot_node(node)}")
 
+    # Render barrier nodes as diamonds between dispatches
+    if barriers:
+        lines.append("  // Barrier nodes")
+        for b in barriers:
+            if b.after_dispatch_id < 0:
+                continue
+            scope_label = "B" if b.scope == "buffers" else "R"
+            lines.append(
+                f'  barrier{b.barrier_id} [shape=diamond, '
+                f'style=filled, fillcolor=lightsalmon, '
+                f'label="{scope_label}", width=0.4, height=0.4, '
+                f'tooltip="barrier #{b.barrier_id} ({b.scope})"];'
+            )
+        lines.append("")
+
     lines.append("")
 
     for edge in graph.edges:
         color = _DEP_COLORS.get(edge.dep_type, "black")
         label = edge.dep_type.value
-        lines.append(
-            f"  D{edge.source_id} -> D{edge.target_id} "
-            f'[color={color}, label="{label}", '
-            f'tooltip="buf 0x{edge.buffer_addr:x}"];'
-        )
+        if edge.buffer_addr == 0:
+            # Barrier-induced edge
+            lines.append(
+                f"  D{edge.source_id} -> D{edge.target_id} "
+                f'[color=red, style=dashed, label="barrier"];'
+            )
+        else:
+            lines.append(
+                f"  D{edge.source_id} -> D{edge.target_id} "
+                f'[color={color}, label="{label}", '
+                f'tooltip="buf 0x{edge.buffer_addr:x}"];'
+            )
+
+    # Render barrier edges (barrier diamond between pre/post dispatches)
+    if barriers:
+        # Group dispatches by encoder for barrier edge rendering
+        enc_dispatches: dict[int, list[int]] = defaultdict(list)
+        for node in graph.nodes:
+            enc_dispatches[node.encoder_idx].append(node.dispatch_id)
+
+        for b in barriers:
+            if b.after_dispatch_id < 0:
+                continue
+            dispatches_in_enc = enc_dispatches.get(b.encoder_idx, [])
+            after = [d for d in dispatches_in_enc if d > b.after_dispatch_id]
+            if after:
+                lines.append(
+                    f"  D{b.after_dispatch_id} -> barrier{b.barrier_id} "
+                    f"[style=dashed, color=red, arrowhead=none];"
+                )
+                lines.append(
+                    f"  barrier{b.barrier_id} -> D{after[0]} "
+                    f"[style=dashed, color=red];"
+                )
 
     lines.append("}")
     return "\n".join(lines)
@@ -506,9 +657,10 @@ def format_kernel_dot(graph: DependencyGraph) -> str:
 @dataclass
 class AggregatedNode:
     node_id: str           # "CB0", "E5", "K3"
-    label: str             # "CB #0\n65 dispatches\nlu_gemv(48), lu_solve(17)"
+    label: str             # "CB #0\n65 dispatches, 3 barriers\nlu_gemv(48), lu_solve(17)"
     dispatch_count: int
     kernel_composition: dict[str, int]  # kernel → count
+    barrier_count: int = 0
 
     @property
     def short_composition(self) -> str:
@@ -543,6 +695,7 @@ class AggregatedGraph:
 def build_cb_graph(
     nodes: list[DispatchNode],
     graph: DependencyGraph,
+    barriers: list[BarrierNode] | None = None,
 ) -> AggregatedGraph:
     """Collapse dependency graph to command buffer level.
 
@@ -550,6 +703,11 @@ def build_cb_graph(
     shares a buffer dependency with a dispatch in the other.
     """
     node_map = {n.dispatch_id: n for n in nodes}
+
+    # Count barriers per CB
+    cb_barrier_count: dict[int, int] = defaultdict(int)
+    for b in (barriers or []):
+        cb_barrier_count[b.command_buffer_idx] += 1
 
     # Group dispatches by CB
     cb_dispatches: dict[int, list[DispatchNode]] = defaultdict(list)
@@ -564,14 +722,17 @@ def build_cb_graph(
         for d in dispatches:
             composition[d.kernel] += 1
         nid = f"CB{cb_idx}"
+        b_count = cb_barrier_count.get(cb_idx, 0)
         agg_nodes[nid] = AggregatedNode(
             node_id=nid,
             label="",  # filled below
             dispatch_count=len(dispatches),
             kernel_composition=dict(composition),
+            barrier_count=b_count,
         )
         node = agg_nodes[nid]
-        node.label = f"CB #{cb_idx}\\n{node.dispatch_count} dispatches\\n{node.short_composition}"
+        b_str = f", {b_count} barriers" if b_count else ""
+        node.label = f"CB #{cb_idx}\\n{node.dispatch_count} dispatches{b_str}\\n{node.short_composition}"
 
     # Build aggregated edges
     agg_edges: dict[tuple[str, str], AggregatedEdge] = {}
@@ -598,12 +759,18 @@ def build_cb_graph(
 def build_encoder_graph(
     nodes: list[DispatchNode],
     graph: DependencyGraph,
+    barriers: list[BarrierNode] | None = None,
 ) -> AggregatedGraph:
     """Collapse dependency graph to compute encoder level.
 
     One node per encoder. Clustered by command buffer.
     """
     node_map = {n.dispatch_id: n for n in nodes}
+
+    # Count barriers per encoder
+    enc_barrier_count: dict[int, int] = defaultdict(int)
+    for b in (barriers or []):
+        enc_barrier_count[b.encoder_idx] += 1
 
     # Group dispatches by encoder
     enc_dispatches: dict[int, list[DispatchNode]] = defaultdict(list)
@@ -621,15 +788,18 @@ def build_encoder_graph(
         nid = f"E{enc_idx}"
         cb_idx = dispatches[0].command_buffer_idx if dispatches else -1
         enc_to_cb[nid] = cb_idx
+        b_count = enc_barrier_count.get(enc_idx, 0)
         agg_nodes[nid] = AggregatedNode(
             node_id=nid,
             label="",
             dispatch_count=len(dispatches),
             kernel_composition=dict(composition),
+            barrier_count=b_count,
         )
         node = agg_nodes[nid]
         comp = node.short_composition
-        node.label = f"Encoder #{enc_idx}\\n{node.dispatch_count} dispatches\\n{comp}"
+        b_str = f", {b_count} barriers" if b_count else ""
+        node.label = f"Encoder #{enc_idx}\\n{node.dispatch_count} dispatches{b_str}\\n{comp}"
 
     # Build aggregated edges
     agg_edges: dict[tuple[str, str], AggregatedEdge] = {}
@@ -912,13 +1082,19 @@ def _compute_critical_path_length(graph: DependencyGraph) -> int:
 # Summary output
 # ---------------------------------------------------------------------------
 
-def print_summary(graph: DependencyGraph, num_cbs: int) -> None:
+def print_summary(
+    graph: DependencyGraph,
+    num_cbs: int,
+    num_barriers: int = 0,
+) -> None:
     """Print a human-readable summary of the dependency graph."""
     data = format_json(graph)
     s = data["summary"]
 
     print("\n=== Dependency Graph Summary ===")
     print(f"Dispatches:          {s['total_dispatches']}")
+    if num_barriers:
+        print(f"Barriers:            {num_barriers}")
     print(f"Dependency edges:    {s['total_edges']}")
     print(f"Edge types:          {s['edge_types']}")
     print(f"Critical path:       {s['critical_path_length']} dispatches")
@@ -1097,11 +1273,11 @@ def main() -> None:
         log.error("Failed to read trace file")
         sys.exit(1)
 
-    # Extract dispatches
-    nodes, num_cbs, num_encoders = extract_dispatches(trace_data)
+    # Extract dispatches and barriers
+    nodes, barriers, num_cbs, num_encoders = extract_dispatches(trace_data)
     log.info(
-        "Extracted %d dispatches from %d command buffers, %d encoders",
-        len(nodes), num_cbs, num_encoders,
+        "Extracted %d dispatches, %d barriers from %d command buffers, %d encoders",
+        len(nodes), len(barriers), num_cbs, num_encoders,
     )
 
     if not nodes:
@@ -1134,8 +1310,20 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # Filter barriers to match filtered dispatches
+    if has_filter:
+        # Keep only barriers in filtered encoders with valid dispatch refs
+        filtered_dispatch_ids = {n.dispatch_id for n in nodes}
+        filtered_encoders = {n.encoder_idx for n in nodes}
+        barriers = [
+            b for b in barriers
+            if b.encoder_idx in filtered_encoders
+        ]
+
     # Build dependency graph
-    graph = build_dependency_graph(nodes, conservative=args.conservative)
+    graph = build_dependency_graph(
+        nodes, conservative=args.conservative, barriers=barriers,
+    )
     log.info("Built graph: %d edges", len(graph.edges))
 
     # Validate DAG
@@ -1147,7 +1335,7 @@ def main() -> None:
         log.info("After reduction: %d edges", len(graph.edges))
 
     # Summary
-    print_summary(graph, num_cbs)
+    print_summary(graph, num_cbs, num_barriers=len(barriers))
 
     if args.summary_only:
         return
@@ -1163,10 +1351,10 @@ def main() -> None:
     suffix = _scale_suffix(scale)
 
     if scale == "cb":
-        agg = build_cb_graph(nodes, graph)
+        agg = build_cb_graph(nodes, graph, barriers=barriers)
         dot_content = format_aggregated_dot(agg, title="cb_deps")
     elif scale == "encoder":
-        agg = build_encoder_graph(nodes, graph)
+        agg = build_encoder_graph(nodes, graph, barriers=barriers)
         dot_content = format_aggregated_dot(agg, title="encoder_deps")
     elif scale == "kernel":
         agg = build_kernel_graph(nodes, graph)
@@ -1176,6 +1364,7 @@ def main() -> None:
             graph,
             cluster_by_cb=not args.no_cluster,
             skip_isolated=not args.include_isolated,
+            barriers=barriers if barriers else None,
         )
         agg = None
     else:

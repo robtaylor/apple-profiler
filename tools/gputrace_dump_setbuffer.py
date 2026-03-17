@@ -69,7 +69,7 @@ RELATED_INDICES = {
     -16338: "setComputePipelineState:",
     -16327: "dispatchThreadgroups:threadsPerThreadgroup:",
     -16078: "dispatchThreads:threadsPerThreadgroup: (non-uniform)",
-    -16009: "memoryBarrierWithScope: (NOT a dispatch!)",
+    -16009: "memoryBarrierWithScope:",
 }
 
 

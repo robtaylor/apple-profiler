@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 from gputrace_depgraph import (  # noqa: I001
     AccessMode,
     AggregatedGraph,
+    BarrierNode,
     BufferBinding,
     DepType,
     DependencyEdge,
@@ -372,8 +373,9 @@ class TestExtractDispatches:
             ],
         }
 
-        nodes, num_cbs, num_encoders = extract_dispatches(trace_data)
+        nodes, barriers, num_cbs, num_encoders = extract_dispatches(trace_data)
         assert len(nodes) == 2
+        assert len(barriers) == 0
         assert num_cbs == 1
         assert num_encoders == 2
         assert nodes[0].kernel == "k1"
@@ -387,10 +389,11 @@ class TestExtractDispatches:
         assert len(nodes[1].buffers) == 1
 
     def test_empty_trace(self):
-        nodes, num_cbs, num_encoders = extract_dispatches(
+        nodes, barriers, num_cbs, num_encoders = extract_dispatches(
             {"events": [], "command_buffers": [], "compute_encoders": []}
         )
         assert len(nodes) == 0
+        assert len(barriers) == 0
         assert num_cbs == 0
         assert num_encoders == 0
 
@@ -624,3 +627,276 @@ class TestApplyFilters:
         nodes = [_make_node(0, "kA", cb_idx=0)]
         filtered = _apply_filters(nodes, filter_cb=99)
         assert len(filtered) == 0
+
+
+# ---------------------------------------------------------------------------
+# Barrier tests
+# ---------------------------------------------------------------------------
+
+class TestBarrierExtraction:
+    """Test extraction of barriers from timeline events."""
+
+    def test_barrier_extracted(self):
+        """Barrier events produce BarrierNode objects."""
+        trace_data = {
+            "events": [
+                {
+                    "type": "dispatch",
+                    "kernel": "k1",
+                    "index": 0,
+                    "buffers_bound": {0: 0x100},
+                    "encoder_idx": 0,
+                },
+                {
+                    "type": "barrier",
+                    "scope": "buffers",
+                    "encoder_idx": 0,
+                    "command_buffer_idx": 0,
+                },
+                {
+                    "type": "dispatch",
+                    "kernel": "k2",
+                    "index": 1,
+                    "buffers_bound": {0: 0x200},
+                    "encoder_idx": 0,
+                },
+            ],
+            "command_buffers": [
+                {"func_idx": 5, "dispatches": [{"index": 0}, {"index": 1}]},
+            ],
+            "compute_encoders": [
+                {"encoder_idx": 0, "command_buffer_idx": 0, "dispatches": [{"index": 0}, {"index": 1}]},
+            ],
+        }
+
+        nodes, barriers, num_cbs, num_encoders = extract_dispatches(trace_data)
+        assert len(nodes) == 2
+        assert len(barriers) == 1
+        assert barriers[0].scope == "buffers"
+        assert barriers[0].encoder_idx == 0
+        assert barriers[0].after_dispatch_id == 0  # last dispatch before barrier
+
+    def test_barrier_before_any_dispatch(self):
+        """Barrier at start of encoder has after_dispatch_id = -1."""
+        trace_data = {
+            "events": [
+                {
+                    "type": "barrier",
+                    "scope": "buffers",
+                    "encoder_idx": 0,
+                },
+                {
+                    "type": "dispatch",
+                    "kernel": "k1",
+                    "index": 0,
+                    "buffers_bound": {},
+                    "encoder_idx": 0,
+                },
+            ],
+            "command_buffers": [
+                {"func_idx": 5, "dispatches": [{"index": 0}]},
+            ],
+            "compute_encoders": [
+                {"encoder_idx": 0, "command_buffer_idx": 0, "dispatches": [{"index": 0}]},
+            ],
+        }
+
+        nodes, barriers, _, _ = extract_dispatches(trace_data)
+        assert len(barriers) == 1
+        assert barriers[0].after_dispatch_id == -1
+
+    def test_multiple_barriers(self):
+        """Multiple barriers in same encoder tracked correctly."""
+        trace_data = {
+            "events": [
+                {"type": "dispatch", "kernel": "k1", "index": 0, "buffers_bound": {}, "encoder_idx": 0},
+                {"type": "barrier", "scope": "buffers", "encoder_idx": 0},
+                {"type": "dispatch", "kernel": "k2", "index": 1, "buffers_bound": {}, "encoder_idx": 0},
+                {"type": "barrier", "scope": "resources", "encoder_idx": 0},
+                {"type": "dispatch", "kernel": "k3", "index": 2, "buffers_bound": {}, "encoder_idx": 0},
+            ],
+            "command_buffers": [
+                {"func_idx": 5, "dispatches": [{"index": 0}, {"index": 1}, {"index": 2}]},
+            ],
+            "compute_encoders": [
+                {"encoder_idx": 0, "command_buffer_idx": 0, "dispatches": [{"index": 0}, {"index": 1}, {"index": 2}]},
+            ],
+        }
+
+        nodes, barriers, _, _ = extract_dispatches(trace_data)
+        assert len(barriers) == 2
+        assert barriers[0].after_dispatch_id == 0
+        assert barriers[0].scope == "buffers"
+        assert barriers[1].after_dispatch_id == 1
+        assert barriers[1].scope == "resources"
+
+
+class TestBarrierEdges:
+    """Test that barriers create edges in the dependency graph."""
+
+    def test_barrier_creates_edge(self):
+        """Barrier between two dispatches with no shared buffers still creates edge."""
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, AccessMode.UNKNOWN)], encoder_idx=0),
+            _make_node(1, "kB", [(0x200, 0, AccessMode.UNKNOWN)], encoder_idx=0),
+        ]
+        barriers = [
+            BarrierNode(barrier_id=0, scope="buffers", encoder_idx=0, after_dispatch_id=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True, barriers=barriers)
+        assert len(graph.edges) == 1
+        assert graph.edges[0].source_id == 0
+        assert graph.edges[0].target_id == 1
+
+    def test_barrier_no_edge_if_already_connected(self):
+        """Barrier doesn't duplicate an existing buffer-based edge."""
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, AccessMode.UNKNOWN)], encoder_idx=0),
+            _make_node(1, "kB", [(0x100, 0, AccessMode.UNKNOWN)], encoder_idx=0),
+        ]
+        barriers = [
+            BarrierNode(barrier_id=0, scope="buffers", encoder_idx=0, after_dispatch_id=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True, barriers=barriers)
+        # Only 1 edge (from shared buffer), barrier doesn't add duplicate
+        assert len(graph.edges) == 1
+        assert graph.edges[0].buffer_addr == 0x100
+
+    def test_barrier_cross_encoder_ignored(self):
+        """Barrier only affects dispatches within the same encoder."""
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, AccessMode.UNKNOWN)], encoder_idx=0),
+            _make_node(1, "kB", [(0x200, 0, AccessMode.UNKNOWN)], encoder_idx=1),
+        ]
+        # This barrier is in encoder 0 but after_dispatch_id=0; dispatch 1 is in encoder 1
+        barriers = [
+            BarrierNode(barrier_id=0, scope="buffers", encoder_idx=0, after_dispatch_id=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True, barriers=barriers)
+        # No edges: no shared buffers, barrier only affects encoder 0
+        assert len(graph.edges) == 0
+
+    def test_barrier_before_any_dispatch_no_edge(self):
+        """Barrier before first dispatch creates no edge."""
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, AccessMode.UNKNOWN)], encoder_idx=0),
+        ]
+        barriers = [
+            BarrierNode(barrier_id=0, scope="buffers", encoder_idx=0, after_dispatch_id=-1),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True, barriers=barriers)
+        assert len(graph.edges) == 0
+
+    def test_barrier_with_three_dispatches(self):
+        """D0 → [barrier] → D1 → D2: barrier creates D0→D1 edge."""
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, AccessMode.UNKNOWN)], encoder_idx=0),
+            _make_node(1, "kB", [(0x200, 0, AccessMode.UNKNOWN)], encoder_idx=0),
+            _make_node(2, "kC", [(0x200, 0, AccessMode.UNKNOWN)], encoder_idx=0),
+        ]
+        barriers = [
+            BarrierNode(barrier_id=0, scope="buffers", encoder_idx=0, after_dispatch_id=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True, barriers=barriers)
+        edge_pairs = {(e.source_id, e.target_id) for e in graph.edges}
+        # D0→D1 from barrier, D1→D2 from shared buffer 0x200
+        assert (0, 1) in edge_pairs
+        assert (1, 2) in edge_pairs
+
+    def test_no_barriers_unchanged(self):
+        """Graph with no barriers behaves exactly as before."""
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, AccessMode.UNKNOWN)]),
+            _make_node(1, "kB", [(0x100, 0, AccessMode.UNKNOWN)]),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True, barriers=None)
+        assert len(graph.edges) == 1
+        assert graph.edges[0].dep_type == DepType.SHARED
+
+
+class TestBarrierDotOutput:
+    """Test that barrier nodes render in DOT output."""
+
+    def test_barrier_diamond_in_dot(self):
+        """Barriers render as diamond nodes in DOT."""
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, AccessMode.UNKNOWN)], cb_idx=0, encoder_idx=0),
+            _make_node(1, "kB", [(0x200, 0, AccessMode.UNKNOWN)], cb_idx=0, encoder_idx=0),
+        ]
+        barriers = [
+            BarrierNode(barrier_id=0, scope="buffers", encoder_idx=0, after_dispatch_id=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True, barriers=barriers)
+        dot = format_dot(graph, cluster_by_cb=True, barriers=barriers)
+        assert "barrier0" in dot
+        assert "diamond" in dot
+        assert "D0 -> barrier0" in dot
+        assert "barrier0 -> D1" in dot
+
+    def test_no_barriers_no_diamonds(self):
+        """DOT without barriers has no barrier rendering."""
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, AccessMode.UNKNOWN)], cb_idx=0),
+            _make_node(1, "kB", [(0x100, 0, AccessMode.UNKNOWN)], cb_idx=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True)
+        dot = format_dot(graph, cluster_by_cb=True)
+        assert "barrier" not in dot.lower() or "barrier" not in dot
+
+    def test_barrier_edge_label(self):
+        """Barrier-induced edges labeled 'barrier' in DOT."""
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, AccessMode.UNKNOWN)], cb_idx=0, encoder_idx=0),
+            _make_node(1, "kB", [(0x200, 0, AccessMode.UNKNOWN)], cb_idx=0, encoder_idx=0),
+        ]
+        barriers = [
+            BarrierNode(barrier_id=0, scope="buffers", encoder_idx=0, after_dispatch_id=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True, barriers=barriers)
+        dot = format_dot(graph, cluster_by_cb=True, barriers=barriers)
+        assert 'label="barrier"' in dot
+
+
+class TestAggregatedBarrierCounts:
+    """Test that aggregated graphs include barrier counts."""
+
+    def test_cb_graph_barrier_count(self):
+        """CB graph includes barrier count in label."""
+        U = AccessMode.UNKNOWN
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, U)], cb_idx=0, encoder_idx=0),
+            _make_node(1, "kB", [(0x200, 0, U)], cb_idx=0, encoder_idx=0),
+        ]
+        barriers = [
+            BarrierNode(barrier_id=0, scope="buffers", encoder_idx=0, command_buffer_idx=0, after_dispatch_id=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True, barriers=barriers)
+        agg = build_cb_graph(nodes, graph, barriers=barriers)
+        assert agg.nodes[0].barrier_count == 1
+        assert "1 barriers" in agg.nodes[0].label
+
+    def test_encoder_graph_barrier_count(self):
+        """Encoder graph includes barrier count in label."""
+        U = AccessMode.UNKNOWN
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, U)], cb_idx=0, encoder_idx=0),
+            _make_node(1, "kB", [(0x200, 0, U)], cb_idx=0, encoder_idx=0),
+        ]
+        barriers = [
+            BarrierNode(barrier_id=0, scope="buffers", encoder_idx=0, command_buffer_idx=0, after_dispatch_id=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True, barriers=barriers)
+        agg = build_encoder_graph(nodes, graph, barriers=barriers)
+        by_id = {n.node_id: n for n in agg.nodes}
+        assert by_id["E0"].barrier_count == 1
+        assert "1 barriers" in by_id["E0"].label
+
+    def test_no_barriers_no_count_in_label(self):
+        """Without barriers, label doesn't mention barriers."""
+        U = AccessMode.UNKNOWN
+        nodes = [
+            _make_node(0, "kA", [(0x100, 0, U)], cb_idx=0, encoder_idx=0),
+        ]
+        graph = build_dependency_graph(nodes, conservative=True)
+        agg = build_encoder_graph(nodes, graph)
+        assert "barrier" not in agg.nodes[0].label
