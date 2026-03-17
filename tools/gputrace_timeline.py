@@ -200,14 +200,15 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
     # --- Results ---
     events: list[dict[str, Any]] = []
     command_buffers: list[dict[str, Any]] = []
-    current_cb_dispatches: list[dict[str, Any]] = []
     compute_encoders: list[dict[str, Any]] = []
     current_encoder_dispatches: list[dict[str, Any]] = []
     encoder_counter: int = 0
     current_encoder_idx: int = -1
     current_encoder_addr: str = ""
-    current_cb_idx: int = -1
-    current_cb_addr: str = ""
+    # Track multiple concurrent CBs (unsorted stream interleaves them).
+    # Keyed by CB address (off16 from -16352/-16355/-16363).
+    active_cbs: dict[str, dict[str, Any]] = {}
+    current_cb_addr: str = ""  # points to the currently-active CB key
 
     func_idx = 0
     while True:
@@ -261,79 +262,91 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
         # ---- Command buffer lifecycle ----
 
         elif idx == -16352:  # MTLCommandQueue.commandBuffer
-            # NOTE: -16352 fires per-encoder too, not just per-CB.
-            # Use the return value address to detect new CBs vs re-fires.
+            # -16352 fires per-encoder, not just per-CB.
+            # off16 = CB address, return value = encoder address.
+            cb_addr_16352 = struct.unpack_from("<Q", raw_header, 16)[0]
+            cb_addr_str = f"0x{cb_addr_16352:x}" if cb_addr_16352 else ""
+            if cb_addr_str:
+                current_cb_addr = cb_addr_str
+                if cb_addr_str not in active_cbs:
+                    active_cbs[cb_addr_str] = {
+                        "cb_idx": len(command_buffers) + len(active_cbs),
+                        "addr": cb_addr_str,
+                        "dispatches": [],
+                    }
+            # Capture encoder address from return value
             if trace and "=" in trace:
-                ret_str = trace.split("=")[0].strip()
-                if ret_str.startswith("0x") and ret_str != current_cb_addr:
-                    # New command buffer (different return address)
-                    current_cb_addr = ret_str
-                    current_cb_dispatches = []
-                    current_cb_idx = len(command_buffers)
+                enc_ret = trace.split("=")[0].strip().rstrip("l")
+                if enc_ret.startswith("0x"):
+                    current_encoder_addr = enc_ret
 
         elif idx == -16363:  # MTLCommandBuffer.commit
-            # Close any open encoder before closing the command buffer
+            # off16 = CB address being committed
+            commit_addr = struct.unpack_from("<Q", raw_header, 16)[0]
+            commit_key = f"0x{commit_addr:x}" if commit_addr else current_cb_addr
+            # Resolve the CB from active_cbs
+            cb_info = active_cbs.pop(commit_key, None)
+            if cb_info is None and current_cb_addr:
+                cb_info = active_cbs.pop(current_cb_addr, None)
+            # Close any open encoder belonging to this CB
             if current_encoder_dispatches:
+                cb_idx = cb_info["cb_idx"] if cb_info else -1
                 compute_encoders.append({
                     "encoder_idx": current_encoder_idx,
-                    "command_buffer_idx": current_cb_idx,
+                    "command_buffer_idx": cb_idx,
                     "addr": current_encoder_addr,
                     "dispatches": list(current_encoder_dispatches),
                 })
                 current_encoder_dispatches = []
                 current_encoder_idx = -1
                 current_encoder_addr = ""
-            if current_cb_dispatches:
+            if cb_info and cb_info["dispatches"]:
                 command_buffers.append({
                     "func_idx": func_idx,
-                    "addr": current_cb_addr,
-                    "dispatches": list(current_cb_dispatches),
+                    "addr": cb_info["addr"],
+                    "dispatches": cb_info["dispatches"],
                 })
-            current_cb_dispatches = []
-            current_cb_addr = ""
+            if commit_key == current_cb_addr:
+                current_cb_addr = ""
 
         # ---- Encoder lifecycle ----
 
         elif idx == -16355:  # MTLCommandBuffer.computeCommandEncoder
             # Close any previous open encoder
             if current_encoder_dispatches:
+                cb_idx = active_cbs[current_cb_addr]["cb_idx"] if current_cb_addr in active_cbs else -1
                 compute_encoders.append({
                     "encoder_idx": current_encoder_idx,
-                    "command_buffer_idx": current_cb_idx,
+                    "command_buffer_idx": cb_idx,
                     "addr": current_encoder_addr,
                     "dispatches": list(current_encoder_dispatches),
                 })
                 current_encoder_dispatches = []
             current_encoder_idx = encoder_counter
             encoder_counter += 1
-            # Capture encoder address from trace return value
-            current_encoder_addr = ""
-            if trace and "=" in trace:
-                enc_ret = trace.split("=")[0].strip()
-                if enc_ret.startswith("0x"):
-                    current_encoder_addr = enc_ret
-            # The receiver (offset 16) of computeCommandEncoder() is the
-            # MTLCommandBuffer — use it as the authoritative CB address.
-            receiver = struct.unpack_from("<Q", raw_header, 16)[0]
-            if receiver:
-                cb_addr = f"0x{receiver:x}"
-                if cb_addr != current_cb_addr:
-                    # CB address changed — this is a new command buffer that
-                    # wasn't announced by a -16352 call.
-                    current_cb_addr = cb_addr
-                    current_cb_dispatches = []
-                    current_cb_idx = len(command_buffers)
-                elif not current_cb_addr:
-                    current_cb_addr = cb_addr
+            # off16 = CB address (confirms/sets current CB)
+            # -16355 has no return value — encoder addr comes from
+            # the preceding -16352's return value (already captured).
+            cb_addr_16355 = struct.unpack_from("<Q", raw_header, 16)[0]
+            if cb_addr_16355:
+                cb_addr = f"0x{cb_addr_16355:x}"
+                current_cb_addr = cb_addr
+                if cb_addr not in active_cbs:
+                    active_cbs[cb_addr] = {
+                        "cb_idx": len(command_buffers) + len(active_cbs),
+                        "addr": cb_addr,
+                        "dispatches": [],
+                    }
             # Don't reset pipeline — it carries over because encoder creation
             # isn't always explicit in the unsorted-capture stream.
             buffers_bound = {}
 
         elif idx in (-16325, -16370):  # endEncoding
             if current_encoder_dispatches:
+                cb_idx = active_cbs[current_cb_addr]["cb_idx"] if current_cb_addr in active_cbs else -1
                 compute_encoders.append({
                     "encoder_idx": current_encoder_idx,
-                    "command_buffer_idx": current_cb_idx,
+                    "command_buffer_idx": cb_idx,
                     "addr": current_encoder_addr,
                     "dispatches": list(current_encoder_dispatches),
                 })
@@ -454,7 +467,8 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                 event["threads_per_threadgroup"] = threads_per
 
             events.append(event)
-            current_cb_dispatches.append(event)
+            if current_cb_addr in active_cbs:
+                active_cbs[current_cb_addr]["dispatches"].append(event)
             current_encoder_dispatches.append(event)
             buffers_bound = {}
 
