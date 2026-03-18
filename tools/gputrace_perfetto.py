@@ -200,7 +200,7 @@ def _group_by_pipeline(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 "name": f"barrier ({scope})",
                 "cat": "barrier",
                 "pid": BARRIER_PID,
-                "tid": enc_idx,
+                "tid": 0,
                 "ts": func_idx,
                 "s": "t",
                 "args": {
