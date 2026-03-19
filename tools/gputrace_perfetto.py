@@ -438,6 +438,7 @@ def _group_by_cb(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
 def timeline_to_pftrace(
     data: dict[str, Any],
     group_by: str = "pipeline",
+    counters: dict[str, Any] | None = None,
 ) -> bytes:
     """Convert read_gputrace() output to Perfetto protobuf (.pftrace) format.
 
@@ -445,23 +446,34 @@ def timeline_to_pftrace(
         data: Output from read_gputrace().
         group_by: "pipeline" uses GpuRenderStageEvent for dispatches (GPU UI),
                   "cb" uses all TrackEvent (process per CB).
+        counters: Optional output from read_gputrace_counters(). When provided,
+                  GpuCounterEvent packets are appended for GPU utilization tracks.
 
     Returns serialized protobuf bytes suitable for writing to a .pftrace file.
     """
     if group_by == "pipeline":
-        return _pftrace_pipeline(data)
+        trace = _pftrace_pipeline(data)
     elif group_by == "cb":
-        return _pftrace_cb(data)
+        trace = _pftrace_cb(data)
     else:
         raise ValueError(f"Unknown group_by mode: {group_by!r}")
+
+    if counters is not None:
+        from perfetto.protos.perfetto.trace import perfetto_trace_pb2 as pb
+        _add_gpu_counters(trace, pb, counters)
+
+    return trace.SerializeToString()
 
 
 # Pipeline mode sequence ID
 _GPU_SEQ = 1
 
 
-def _pftrace_pipeline(data: dict[str, Any]) -> bytes:
-    """Pipeline-grouped pftrace: GpuRenderStageEvent dispatches + TrackEvent barriers/spans."""
+def _pftrace_pipeline(data: dict[str, Any]) -> Any:
+    """Pipeline-grouped pftrace: GpuRenderStageEvent dispatches + TrackEvent barriers/spans.
+
+    Returns a pb.Trace() object (not yet serialized).
+    """
     from perfetto.protos.perfetto.trace import perfetto_trace_pb2 as pb
 
     trace = pb.Trace()
@@ -575,7 +587,7 @@ def _pftrace_pipeline(data: dict[str, Any]) -> bytes:
     # Pipeline mode: GpuRenderStageEvent carries all context (encoder/CB in
     # extra_data). No TrackEvent tracks needed — they just add noise.
 
-    return trace.SerializeToString()
+    return trace
 
 
 # CB-grouped pftrace UUIDs
@@ -585,8 +597,11 @@ _CB_ENCODER_BASE = 3000    # encoder N -> 3000+N
 _CB_PFTRACE_SEQ = 1
 
 
-def _pftrace_cb(data: dict[str, Any]) -> bytes:
-    """CB-grouped pftrace: all TrackEvent — process per CB, child tracks per encoder."""
+def _pftrace_cb(data: dict[str, Any]) -> Any:
+    """CB-grouped pftrace: all TrackEvent — process per CB, child tracks per encoder.
+
+    Returns a pb.Trace() object (not yet serialized).
+    """
     from perfetto.protos.perfetto.trace import perfetto_trace_pb2 as pb
 
     trace = pb.Trace()
@@ -806,7 +821,131 @@ def _pftrace_cb(data: dict[str, Any]) -> bytes:
         end_te.type = pb.TrackEvent.TYPE_SLICE_END
         end_te.track_uuid = overview_uuid
 
-    return trace.SerializeToString()
+    return trace
+
+
+# ---------------------------------------------------------------------------
+# GPU performance counter tracks
+# ---------------------------------------------------------------------------
+
+_COUNTER_SEQ = 3
+
+# Counter name → GpuCounterGroup enum value mapping
+# Values: UNCLASSIFIED=0, SYSTEM=1, VERTICES=2, FRAGMENTS=3,
+#         PRIMITIVES=4, MEMORY=5, COMPUTE=6, RAY_TRACING=7
+_COUNTER_GROUPS: dict[str, int] = {
+    "ALUUtilization": 6,       # COMPUTE
+    "GPUCycles": 1,            # SYSTEM
+    "GPUReadBandwidth": 5,     # MEMORY
+    "GPUWriteBandwidth": 5,    # MEMORY
+    "L2CacheUtilization": 5,   # MEMORY
+    "L2CacheLimiter": 5,       # MEMORY
+    "L2CacheMissRate": 5,      # MEMORY
+    "MainMemoryReadBytes": 5,  # MEMORY
+    "MainMemoryWriteBytes": 5, # MEMORY
+    "MainMemoryThroughput": 5, # MEMORY
+    "MainMemoryTraffic": 5,    # MEMORY
+    "BytesWrittenToMainMemory": 5,  # MEMORY
+    "MMULimiter": 5,           # MEMORY
+    "MMUUtilization": 5,       # MEMORY
+    "TextureFilteringLimiter": 3,  # FRAGMENTS
+    "TextureSamples": 3,       # FRAGMENTS
+    "TextureAccesses": 3,      # FRAGMENTS
+    "SampleLimiter": 3,        # FRAGMENTS
+    "TPULimiter": 3,           # FRAGMENTS
+    "FragmentSampleLimiter": 3,  # FRAGMENTS
+    "FragmentTPULimiter": 3,   # FRAGMENTS
+    # Vertex-stage counters
+    "VSArithmeticIntensity": 2,  # VERTICES
+    "VSBytesReadFromMainMemory": 2,  # VERTICES
+    "VSBytesWrittenToMainMemory": 2,  # VERTICES
+    "VSMainMemoryThroughput": 2,  # VERTICES
+    "VSTextureSamples": 2,     # VERTICES
+    "VSTextureSamplesPerInvocation": 2,  # VERTICES
+    "VSVertexCount": 2,        # VERTICES
+    "VertexSampleLimiter": 2,  # VERTICES
+    "VertexTPULimiter": 2,     # VERTICES
+    # Fragment-stage counters
+    "FSArithmeticIntensity": 3,  # FRAGMENTS
+    "FSBytesReadFromMainMemory": 3,  # FRAGMENTS
+    "FSBytesWrittenToMainMemory": 3,  # FRAGMENTS
+    "FSMainMemoryThroughput": 3,  # FRAGMENTS
+    "FSTextureSamples": 3,     # FRAGMENTS
+    "FSTextureSamplesPerInvocation": 3,  # FRAGMENTS
+    "FSVertexCount": 3,        # FRAGMENTS
+    # Compute-stage counters
+    "CSArithmeticIntensity": 6,  # COMPUTE
+    "CSTextureSamples": 6,     # COMPUTE
+    "CSTextureSamplesPerInvocation": 6,  # COMPUTE
+    # Compression
+    "CompressionRatioTextureMemoryRead": 5,  # MEMORY
+    "UnCompressedSamplesPercent": 3,  # FRAGMENTS
+    "PredicatedTextureReadPercentage": 3,  # FRAGMENTS
+    "MissBufferFullStallRatio": 5,  # MEMORY
+    "MMUTLBRequests": 5,       # MEMORY
+}
+
+
+def _add_gpu_counters(trace: Any, pb: Any, counters: dict[str, Any]) -> None:
+    """Append GpuCounterEvent packets to a Trace protobuf.
+
+    Args:
+        trace: pb.Trace() object to append to.
+        pb: The perfetto_trace_pb2 module.
+        counters: Output from read_gputrace_counters().
+    """
+    counter_names: list[str] = counters["counter_names"]
+    num_samples: int = counters["num_samples"]
+    timestamps_ns: list[int] = counters["timestamps_ns"]
+    samples: list[list[float]] = counters["samples"]
+    num_counters = len(counter_names)
+
+    # Identify non-zero counter indices (at least one sample has non-zero value)
+    nonzero_indices: list[int] = []
+    for c in range(num_counters):
+        if any(samples[s][c] != 0.0 for s in range(num_samples)):
+            nonzero_indices.append(c)
+
+    if not nonzero_indices:
+        return
+
+    # Descriptor packet (declares all counters, sent once)
+    desc_pkt = trace.packet.add()
+    desc_pkt.timestamp = 0
+    desc_pkt.trusted_packet_sequence_id = _COUNTER_SEQ
+
+    for c in nonzero_indices:
+        name = counter_names[c]
+        spec = desc_pkt.gpu_counter_event.counter_descriptor.specs.add()
+        spec.counter_id = c
+        spec.name = name
+
+        # Assign unit based on name pattern
+        if "Utilization" in name or "Limiter" in name or "Percent" in name or "Rate" in name:
+            spec.numerator_units.append(pb.GpuCounterDescriptor.PERCENT)
+        elif "Bytes" in name or "Bandwidth" in name or "Throughput" in name or "Traffic" in name:
+            spec.numerator_units.append(pb.GpuCounterDescriptor.BYTE)
+        else:
+            spec.numerator_units.append(pb.GpuCounterDescriptor.NONE)
+
+        # Assign group
+        group = _COUNTER_GROUPS.get(name, 0)  # 0 = UNCLASSIFIED
+        spec.groups.append(group)
+
+    desc_pkt.gpu_counter_event.gpu_id = 0
+
+    # Sample packets (one per timestamp, with all non-zero counter values)
+    for s in range(num_samples):
+        pkt = trace.packet.add()
+        pkt.timestamp = timestamps_ns[s]
+        pkt.trusted_packet_sequence_id = _COUNTER_SEQ
+
+        for c in nonzero_indices:
+            counter = pkt.gpu_counter_event.counters.add()
+            counter.counter_id = c
+            counter.double_value = samples[s][c]
+
+        pkt.gpu_counter_event.gpu_id = 0
 
 
 # ---------------------------------------------------------------------------
@@ -834,6 +973,10 @@ def main() -> None:
              "'pftrace' for Perfetto protobuf binary.",
     )
     parser.add_argument(
+        "--counters", action="store_true",
+        help="Include GPU performance counter tracks (requires shader profiling data)",
+    )
+    parser.add_argument(
         "--open", action="store_true",
         help="Open ui.perfetto.dev in browser after export",
     )
@@ -853,6 +996,31 @@ def main() -> None:
         log.error("Failed to read %s", args.gputrace)
         sys.exit(1)
 
+    # Extract GPU performance counters if requested
+    counter_data: dict[str, Any] | None = None
+    if args.counters:
+        if args.format != "pftrace":
+            log.warning("--counters is only supported with --format pftrace; ignoring")
+        else:
+            from gputrace_timeline import read_gputrace_counters
+            counter_data = read_gputrace_counters(args.gputrace)
+            if counter_data is not None:
+                # Filter to non-zero counters for summary
+                num_counters = len(counter_data["counter_names"])
+                num_nonzero = sum(
+                    1 for c in range(num_counters)
+                    if any(
+                        counter_data["samples"][s][c] != 0.0
+                        for s in range(counter_data["num_samples"])
+                    )
+                )
+                log.info(
+                    "GPU counters: %d total, %d non-zero, %d samples",
+                    num_counters, num_nonzero, counter_data["num_samples"],
+                )
+            else:
+                log.warning("No GPU counter data found (shader profiling not enabled?)")
+
     ext = ".pftrace" if args.format == "pftrace" else ".json"
     output_path = args.output
     if output_path is None:
@@ -860,7 +1028,9 @@ def main() -> None:
         output_path = f"{stem}_perfetto{ext}"
 
     if args.format == "pftrace":
-        trace_bytes = timeline_to_pftrace(trace_data, group_by=args.group_by)
+        trace_bytes = timeline_to_pftrace(
+            trace_data, group_by=args.group_by, counters=counter_data,
+        )
         with open(output_path, "wb") as f:
             f.write(trace_bytes)
         log.info("Wrote %d bytes to %s", len(trace_bytes), output_path)

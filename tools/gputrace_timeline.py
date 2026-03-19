@@ -26,6 +26,7 @@ See memory/gputrace-format.md for detailed format documentation.
 from __future__ import annotations
 
 import ctypes
+import glob as globmod
 import logging
 import os
 import re
@@ -36,7 +37,7 @@ from collections import defaultdict
 from typing import Any
 
 import objc  # type: ignore[import-untyped]
-from Foundation import NSBundle, NSURL  # type: ignore[import-untyped]
+from Foundation import NSURL, NSBundle  # type: ignore[import-untyped]
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -501,6 +502,182 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
         "pipelines": pipelines,
         "command_buffers": command_buffers,
         "compute_encoders": compute_encoders,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GPU performance counter extraction
+# ---------------------------------------------------------------------------
+
+# Additional framework path for shader profiler
+_GPU_DEBUGGER_PLUGIN = (
+    "/Applications/Xcode.app/Contents/PlugIns/GPUDebugger.ideplugin"
+    "/Contents/Frameworks"
+)
+
+_PROFILER_FRAMEWORK_NAMES = [
+    "GPUToolsShaderProfiler",
+]
+
+
+def _load_profiler_frameworks() -> bool:
+    """Load GTShaderProfiler + dependencies for counter extraction.
+
+    Returns True if all frameworks loaded successfully.
+    """
+    # Shared framework dependencies
+    for name in _PROFILER_FRAMEWORK_NAMES:
+        bundle = NSBundle.bundleWithPath_(f"{SHARED_FW}/{name}.framework")
+        if bundle is not None:
+            bundle.load()
+
+    # GTShaderProfiler from GPUDebugger plugin
+    gt_path = f"{_GPU_DEBUGGER_PLUGIN}/GTShaderProfiler.framework"
+    bundle = NSBundle.bundleWithPath_(gt_path)
+    if bundle is None:
+        log.warning("GTShaderProfiler.framework not found at %s", gt_path)
+        return False
+    bundle.load()
+    return True
+
+
+def read_gputrace_counters(gputrace_path: str) -> dict[str, Any] | None:
+    """Extract derived GPU performance counter samples from streamData.
+
+    Requires GTShaderProfiler.framework (loaded from GPUDebugger.ideplugin).
+    Returns None if streamData is missing or frameworks unavailable.
+
+    Returns a dict with keys:
+      counter_names  - list of counter name strings
+      num_samples    - number of periodic samples
+      timestamps_ns  - list of uint64 timestamps in nanoseconds
+      samples        - list of lists: samples[i][j] = float value for
+                       sample i, counter j
+    """
+    # Find streamData inside the gputrace bundle
+    pattern = os.path.join(gputrace_path, "*.gpuprofiler_raw", "streamData")
+    matches = globmod.glob(pattern)
+    if not matches:
+        log.info("No streamData found in %s (shader profiling not enabled?)", gputrace_path)
+        return None
+
+    stream_path = matches[0]
+    log.info("Found streamData: %s", stream_path)
+
+    # Load profiler frameworks
+    if not _load_profiler_frameworks():
+        return None
+
+    # Import ObjC classes
+    from Foundation import NSData, NSKeyedUnarchiver, NSSet  # type: ignore[import-untyped]
+
+    try:
+        GTShaderProfilerStreamData = objc.lookUpClass("GTShaderProfilerStreamData")
+        GTMutableShaderProfilerStreamData = objc.lookUpClass("GTMutableShaderProfilerStreamData")
+        GTAGX2StreamDataTimelineProcessor = objc.lookUpClass("GTAGX2StreamDataTimelineProcessor")
+    except objc.nosuchclass_error as e:
+        log.warning("Required ObjC class not found: %s", e)
+        return None
+
+    # Read and unarchive streamData
+    data = NSData.dataWithContentsOfFile_(stream_path)
+    if data is None:
+        log.warning("Failed to read streamData at %s", stream_path)
+        return None
+
+    allowlist = NSSet.setWithArray_([
+        GTShaderProfilerStreamData,
+        GTMutableShaderProfilerStreamData,
+        objc.lookUpClass("NSMutableArray"),
+        objc.lookUpClass("NSMutableDictionary"),
+        objc.lookUpClass("NSMutableData"),
+        objc.lookUpClass("NSArray"),
+        objc.lookUpClass("NSDictionary"),
+        objc.lookUpClass("NSData"),
+        objc.lookUpClass("NSString"),
+        objc.lookUpClass("NSNumber"),
+    ])
+
+    result = NSKeyedUnarchiver.unarchivedObjectOfClasses_fromData_error_(
+        allowlist, data, None
+    )
+    sd = result[0] if isinstance(result, tuple) else result
+    if sd is None:
+        log.warning("Failed to unarchive streamData")
+        return None
+
+    # Process through timeline processor
+    processor = GTAGX2StreamDataTimelineProcessor.alloc().initWithStreamData_(sd)
+    processor.processStreamData()
+    tl_info = processor.timelineInfo()
+    agg = tl_info.aggregatedGPUTimelineInfo()
+    if agg is None:
+        log.warning("No aggregated GPU timeline info available")
+        return None
+
+    # Extract counter names
+    names_ns = agg.derivedCounterNames()
+    if names_ns is None or names_ns.count() == 0:
+        log.info("No derived counter names found")
+        return None
+
+    counter_names: list[str] = []
+    for i in range(names_ns.count()):
+        counter_names.append(str(names_ns.objectAtIndex_(i)))
+
+    # Extract sample count
+    num_samples = int(agg.numPeriodicSamples())
+    if num_samples == 0:
+        log.info("No periodic samples found")
+        return None
+
+    num_counters = len(counter_names)
+
+    # Extract derived counter values (float32 array)
+    dc = agg.derivedCounters()
+    if dc is None or dc.length() == 0:
+        log.warning("No derived counter data")
+        return None
+
+    expected_bytes = num_samples * num_counters * 4
+    assert dc.length() == expected_bytes, (
+        f"derivedCounters size mismatch: {dc.length()} != {expected_bytes}"
+    )
+
+    raw_floats = dc.bytes()
+    samples: list[list[float]] = []
+    for s in range(num_samples):
+        row: list[float] = []
+        for c in range(num_counters):
+            offset = (s * num_counters + c) * 4
+            val = struct.unpack_from("<f", raw_floats, offset)[0]
+            row.append(float(val))
+        samples.append(row)
+
+    # Extract timestamps (uint64 array)
+    ts = agg.timestamps()
+    timestamps_ns: list[int] = []
+    if ts is not None and ts.length() > 0:
+        ts_data = ts.bytes()
+        num_ts = ts.length() // 8
+        for i in range(num_ts):
+            t = struct.unpack_from("<Q", ts_data, i * 8)[0]
+            timestamps_ns.append(t)
+
+    assert len(timestamps_ns) == num_samples, (
+        f"timestamp count mismatch: {len(timestamps_ns)} != {num_samples}"
+    )
+
+    log.info(
+        "Extracted %d counters x %d samples",
+        num_counters, num_samples,
+    )
+
+    return {
+        "counter_names": counter_names,
+        "num_samples": num_samples,
+        "timestamps_ns": timestamps_ns,
+        "samples": samples,
     }
 
 

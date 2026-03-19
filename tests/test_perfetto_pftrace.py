@@ -638,3 +638,157 @@ class TestPftraceCBComplex:
         tds = _track_descriptors(trace)
         # 2 CB processes + 2 CB overviews + 3 encoder tracks = 7
         assert len(tds) == 7
+
+
+# -----------------------------------------------------------------------
+# GPU performance counter tracks
+# -----------------------------------------------------------------------
+
+
+def _gpu_counter_events(trace: pb.Trace) -> list:
+    """Extract packets that have gpu_counter_event."""
+    return [p for p in trace.packet if p.HasField("gpu_counter_event")]
+
+
+def _counter_descriptor_pkts(trace: pb.Trace) -> list:
+    """Extract gpu_counter_event packets that have a counter_descriptor with specs."""
+    return [
+        p for p in _gpu_counter_events(trace)
+        if len(p.gpu_counter_event.counter_descriptor.specs) > 0
+    ]
+
+
+def _counter_sample_pkts(trace: pb.Trace) -> list:
+    """Extract gpu_counter_event packets that have counter values (not descriptor-only)."""
+    return [
+        p for p in _gpu_counter_events(trace)
+        if len(p.gpu_counter_event.counters) > 0
+    ]
+
+
+_COUNTER_DATA = {
+    "counter_names": ["ALUUtilization", "GPUCycles", "L2CacheUtilization", "FSVertexCount"],
+    "num_samples": 3,
+    "timestamps_ns": [1000000, 2000000, 3000000],
+    "samples": [
+        [0.85, 1234567.0, 0.42, 0.0],  # FSVertexCount always 0 → filtered
+        [0.91, 1234890.0, 0.38, 0.0],
+        [0.78, 1235200.0, 0.45, 0.0],
+    ],
+}
+
+
+class TestPftraceCounterTracks:
+    """GPU performance counter tracks via GpuCounterEvent."""
+
+    def test_counters_none(self):
+        """counters=None produces no gpu_counter_event packets."""
+        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=None)
+        trace = _parse_trace(raw)
+        assert len(_gpu_counter_events(trace)) == 0
+
+    def test_counter_descriptor_specs(self):
+        """First gpu_counter_event has descriptor with 3 specs (FSVertexCount filtered)."""
+        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
+        trace = _parse_trace(raw)
+        desc_pkts = _counter_descriptor_pkts(trace)
+        assert len(desc_pkts) == 1
+        specs = list(desc_pkts[0].gpu_counter_event.counter_descriptor.specs)
+        assert len(specs) == 3
+
+    def test_counter_spec_names(self):
+        """Spec names match counter_names excluding zero-only counters."""
+        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
+        trace = _parse_trace(raw)
+        desc_pkts = _counter_descriptor_pkts(trace)
+        specs = list(desc_pkts[0].gpu_counter_event.counter_descriptor.specs)
+        names = {s.name for s in specs}
+        assert names == {"ALUUtilization", "GPUCycles", "L2CacheUtilization"}
+
+    def test_counter_spec_groups(self):
+        """ALUUtilization→COMPUTE(6), GPUCycles→SYSTEM(1), L2Cache→MEMORY(5)."""
+        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
+        trace = _parse_trace(raw)
+        desc_pkts = _counter_descriptor_pkts(trace)
+        desc = desc_pkts[0].gpu_counter_event.counter_descriptor
+        specs = {s.name: list(s.groups) for s in desc.specs}
+        assert specs["ALUUtilization"] == [6]   # COMPUTE
+        assert specs["GPUCycles"] == [1]         # SYSTEM
+        assert specs["L2CacheUtilization"] == [5]  # MEMORY
+
+    def test_counter_spec_units(self):
+        """ALUUtilization→PERCENT(37), GPUCycles→NONE(0), L2Cache→PERCENT(37)."""
+        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
+        trace = _parse_trace(raw)
+        desc_pkts = _counter_descriptor_pkts(trace)
+        specs = {
+            s.name: list(s.numerator_units)
+            for s in desc_pkts[0].gpu_counter_event.counter_descriptor.specs
+        }
+        assert specs["ALUUtilization"] == [37]      # PERCENT
+        assert specs["GPUCycles"] == [0]             # NONE
+        assert specs["L2CacheUtilization"] == [37]   # PERCENT
+
+    def test_counter_sample_packets(self):
+        """3 sample packets, each with 3 GpuCounter entries."""
+        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
+        trace = _parse_trace(raw)
+        sample_pkts = _counter_sample_pkts(trace)
+        assert len(sample_pkts) == 3
+        for pkt in sample_pkts:
+            assert len(pkt.gpu_counter_event.counters) == 3
+
+    def test_counter_sample_timestamps(self):
+        """Packet timestamps match timestamps_ns."""
+        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
+        trace = _parse_trace(raw)
+        sample_pkts = _counter_sample_pkts(trace)
+        timestamps = sorted(p.timestamp for p in sample_pkts)
+        assert timestamps == [1000000, 2000000, 3000000]
+
+    def test_counter_sample_values(self):
+        """double_value matches sample values for first sample."""
+        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
+        trace = _parse_trace(raw)
+        sample_pkts = _counter_sample_pkts(trace)
+        # Find the first sample (timestamp=1000000)
+        first = [p for p in sample_pkts if p.timestamp == 1000000]
+        assert len(first) == 1
+        values = {
+            c.counter_id: c.double_value
+            for c in first[0].gpu_counter_event.counters
+        }
+        # counter_id 0=ALUUtilization, 1=GPUCycles, 2=L2CacheUtilization
+        assert abs(values[0] - 0.85) < 1e-5
+        assert abs(values[1] - 1234567.0) < 1e-1
+        assert abs(values[2] - 0.42) < 1e-5
+
+    def test_counter_zero_filtering(self):
+        """All-zero counter (FSVertexCount) absent from both descriptor and samples."""
+        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
+        trace = _parse_trace(raw)
+        # Check descriptor
+        desc_pkts = _counter_descriptor_pkts(trace)
+        spec_names = {s.name for s in desc_pkts[0].gpu_counter_event.counter_descriptor.specs}
+        assert "FSVertexCount" not in spec_names
+        # Check samples: counter_id 3 (FSVertexCount) should not appear
+        sample_pkts = _counter_sample_pkts(trace)
+        for pkt in sample_pkts:
+            counter_ids = {c.counter_id for c in pkt.gpu_counter_event.counters}
+            assert 3 not in counter_ids
+
+    def test_counters_pipeline_mode(self):
+        """gpu_counter_event packets appear alongside GpuRenderStageEvent in pipeline output."""
+        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
+        trace = _parse_trace(raw)
+        # Should have both GPU render stage events AND counter events
+        assert len(_gpu_events(trace)) == 5  # dispatches
+        assert len(_gpu_counter_events(trace)) == 4  # 1 descriptor + 3 samples
+
+    def test_counters_cb_mode(self):
+        """gpu_counter_event packets appear alongside TrackEvent in CB output."""
+        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="cb", counters=_COUNTER_DATA)
+        trace = _parse_trace(raw)
+        # Should have track events (dispatches/barriers/spans) AND counter events
+        assert len(_track_events(trace)) > 0
+        assert len(_gpu_counter_events(trace)) == 4  # 1 descriptor + 3 samples
