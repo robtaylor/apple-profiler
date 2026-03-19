@@ -113,19 +113,19 @@ def _dispatch_args(event: dict[str, Any]) -> dict[str, Any]:
     return args
 
 
-def _build_duration_map(events: list[dict[str, Any]]) -> dict[int, int]:
-    """Map each event's func_idx to its duration (units = func_idx delta).
+def _build_dispatch_duration_map(events: list[dict[str, Any]]) -> dict[int, int]:
+    """Map each dispatch's func_idx to its duration (units = func_idx delta).
 
-    Each event lasts until the next event in the stream. The last event
-    gets a duration of 1. This mirrors Xcode's timeline display.
+    Each dispatch lasts until the next dispatch in the global stream
+    (barriers are skipped — they're sync markers within a dispatch's span).
+    The last dispatch gets a duration of 1.
     """
-    indices = sorted({ev.get("index", 0) for ev in events})
+    dispatch_indices = sorted(
+        ev.get("index", 0) for ev in events if ev.get("type") == "dispatch"
+    )
     dur: dict[int, int] = {}
-    for i, idx in enumerate(indices):
-        if i + 1 < len(indices):
-            dur[idx] = indices[i + 1] - idx
-        else:
-            dur[idx] = 1
+    for i, idx in enumerate(dispatch_indices):
+        dur[idx] = dispatch_indices[i + 1] - idx if i + 1 < len(dispatch_indices) else 1
     return dur
 
 
@@ -456,13 +456,8 @@ def timeline_to_pftrace(
         raise ValueError(f"Unknown group_by mode: {group_by!r}")
 
 
-# Stable UUIDs for pipeline mode tracks
-_PIPELINE_PROCESS_UUID = 1
-_PIPELINE_ENCODER_TRACK_BASE = 200  # encoder N -> 200+N
-
-# Sequence IDs (one per "writer" — GPU events vs TrackEvents)
+# Pipeline mode sequence ID
 _GPU_SEQ = 1
-_TRACK_SEQ = 2
 
 
 def _pftrace_pipeline(data: dict[str, Any]) -> bytes:
@@ -516,7 +511,7 @@ def _pftrace_pipeline(data: dict[str, Any]) -> bytes:
 
     # -- 2. GpuRenderStageEvent packets (dispatches) -----------------------
     # Duration: each event lasts until the next event (Xcode-style).
-    dur_map = _build_duration_map(data.get("events", []))
+    dur_map = _build_dispatch_duration_map(data.get("events", []))
 
     event_id = 0
     for ev in data.get("events", []):
@@ -577,110 +572,8 @@ def _pftrace_pipeline(data: dict[str, Any]) -> bytes:
         ed.name = "cb"
         ed.value = str(cb_idx)
 
-    # -- 3. TrackDescriptor packets (process + encoder tracks) --------------
-
-    # Process track
-    proc_td = trace.packet.add()
-    proc_td.trusted_packet_sequence_id = _TRACK_SEQ
-    proc_td.track_descriptor.uuid = _PIPELINE_PROCESS_UUID
-    proc_td.track_descriptor.name = "GPU Compute"
-    proc_td.track_descriptor.process.pid = 1
-    proc_td.track_descriptor.process.process_name = "GPU Compute"
-
-    # Encoder tracks + func_idx ranges
-    enc_func_ranges: dict[int, tuple[int, int]] = {}
-    for ev in data.get("events", []):
-        func_idx = ev.get("index", 0)
-        enc_idx = ev.get("encoder_idx", 0)
-        if enc_idx in enc_func_ranges:
-            lo, hi = enc_func_ranges[enc_idx]
-            enc_func_ranges[enc_idx] = (min(lo, func_idx), max(hi, func_idx))
-        else:
-            enc_func_ranges[enc_idx] = (func_idx, func_idx)
-
-    for enc in data.get("compute_encoders", []):
-        enc_idx = enc["encoder_idx"]
-        cb_idx = enc.get("command_buffer_idx", 0)
-        addr = enc.get("addr", "")
-
-        enc_td = trace.packet.add()
-        enc_td.trusted_packet_sequence_id = _TRACK_SEQ
-        enc_uuid = _PIPELINE_ENCODER_TRACK_BASE + enc_idx
-        enc_td.track_descriptor.uuid = enc_uuid
-        enc_td.track_descriptor.parent_uuid = _PIPELINE_PROCESS_UUID
-        label = f"Encoder #{enc_idx}"
-        if addr:
-            label += f" ({addr})"
-        label += f" [CB {cb_idx}]"
-        enc_td.track_descriptor.name = label
-
-    # -- 4. TrackEvent — barriers on encoder tracks (TYPE_INSTANT) ----------
-    first_track_event = True
-
-    for ev in data.get("events", []):
-        if ev.get("type") != "barrier":
-            continue
-
-        scope = ev.get("scope", "buffers")
-        func_idx = ev.get("index", 0)
-        enc_idx = ev.get("encoder_idx", 0)
-        cb_idx = encoder_to_cb.get(enc_idx, 0)
-
-        pkt = trace.packet.add()
-        pkt.timestamp = func_idx * 1000
-        pkt.trusted_packet_sequence_id = _TRACK_SEQ
-        if first_track_event:
-            pkt.sequence_flags = 1  # SEQ_INCREMENTAL_STATE_CLEARED
-            first_track_event = False
-
-        te = pkt.track_event
-        te.type = pb.TrackEvent.TYPE_INSTANT
-        te.track_uuid = _PIPELINE_ENCODER_TRACK_BASE + enc_idx
-        te.name = f"barrier ({scope})"
-
-        da = te.debug_annotations.add()
-        da.name = "scope"
-        da.string_value = scope
-
-        da = te.debug_annotations.add()
-        da.name = "cb"
-        da.int_value = cb_idx
-
-    # -- 5. TrackEvent — encoder spans (SLICE_BEGIN / SLICE_END) ------------
-    for enc in data.get("compute_encoders", []):
-        enc_idx = enc["encoder_idx"]
-        if enc_idx not in enc_func_ranges:
-            continue
-
-        lo, hi = enc_func_ranges[enc_idx]
-        enc_uuid = _PIPELINE_ENCODER_TRACK_BASE + enc_idx
-        cb_idx = enc.get("command_buffer_idx", 0)
-        addr = enc.get("addr", "")
-        label = f"Encoder #{enc_idx}"
-        if addr:
-            label += f" ({addr})"
-
-        begin_pkt = trace.packet.add()
-        begin_pkt.timestamp = lo * 1000
-        begin_pkt.trusted_packet_sequence_id = _TRACK_SEQ
-        if first_track_event:
-            begin_pkt.sequence_flags = 1
-            first_track_event = False
-        begin_te = begin_pkt.track_event
-        begin_te.type = pb.TrackEvent.TYPE_SLICE_BEGIN
-        begin_te.track_uuid = enc_uuid
-        begin_te.name = label
-
-        da = begin_te.debug_annotations.add()
-        da.name = "cb"
-        da.int_value = cb_idx
-
-        end_pkt = trace.packet.add()
-        end_pkt.timestamp = (hi + 1) * 1000
-        end_pkt.trusted_packet_sequence_id = _TRACK_SEQ
-        end_te = end_pkt.track_event
-        end_te.type = pb.TrackEvent.TYPE_SLICE_END
-        end_te.track_uuid = enc_uuid
+    # Pipeline mode: GpuRenderStageEvent carries all context (encoder/CB in
+    # extra_data). No TrackEvent tracks needed — they just add noise.
 
     return trace.SerializeToString()
 
@@ -773,7 +666,7 @@ def _pftrace_cb(data: dict[str, Any]) -> bytes:
 
     # -- 2. Dispatch slices + barrier instants on encoder tracks ------------
     # Duration: each event lasts until the next event (Xcode-style).
-    dur_map = _build_duration_map(data.get("events", []))
+    dur_map = _build_dispatch_duration_map(data.get("events", []))
 
     first_event = True
     for ev in data.get("events", []):

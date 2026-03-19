@@ -171,15 +171,17 @@ class TestPftracePipelineDispatches:
         stage_iids = {p.gpu_render_stage_event.stage_iid for p in gpu}
         assert stage_iids == {100}
 
-    def test_dispatch_duration_fills_to_next_event(self):
-        """Duration extends to the next event's func_idx (Xcode-style)."""
+    def test_dispatch_duration_fills_to_next_dispatch(self):
+        """Duration extends to the next dispatch, skipping barriers."""
         data = _make_trace_data(
             events=[
                 {"type": "dispatch", "kernel": "k1", "index": 1, "encoder_idx": 0},
+                {"type": "barrier", "scope": "buffers", "index": 2, "encoder_idx": 0},
                 {"type": "dispatch", "kernel": "k2", "index": 5, "encoder_idx": 0},
-                {"type": "dispatch", "kernel": "k3", "index": 6, "encoder_idx": 0},
+                {"type": "barrier", "scope": "buffers", "index": 6, "encoder_idx": 0},
+                {"type": "dispatch", "kernel": "k3", "index": 10, "encoder_idx": 0},
             ],
-            command_buffers=[{"func_idx": 10}],
+            command_buffers=[{"func_idx": 15}],
             compute_encoders=[{"encoder_idx": 0, "command_buffer_idx": 0}],
         )
         raw = timeline_to_pftrace(data, group_by="pipeline")
@@ -188,12 +190,12 @@ class TestPftracePipelineDispatches:
         durations = sorted(
             (p.timestamp, p.gpu_render_stage_event.duration) for p in gpu
         )
-        # idx=1 → next=5 → dur=4*1000=4000ns
+        # idx=1 → next dispatch=5 (skip barrier@2) → dur=4*1000=4000ns
         assert durations[0] == (1000, 4000)
-        # idx=5 → next=6 → dur=1*1000=1000ns
-        assert durations[1] == (5000, 1000)
-        # idx=6 → last → dur=1*1000=1000ns
-        assert durations[2] == (6000, 1000)
+        # idx=5 → next dispatch=10 (skip barrier@6) → dur=5*1000=5000ns
+        assert durations[1] == (5000, 5000)
+        # idx=10 → last → dur=1*1000=1000ns
+        assert durations[2] == (10000, 1000)
 
     def test_dispatch_timestamp(self):
         data = _make_trace_data(
@@ -255,129 +257,18 @@ class TestPftracePipelineDispatches:
 # -----------------------------------------------------------------------
 
 
-class TestPftracePipelineBarriers:
-    """TrackEvent TYPE_INSTANT for barriers in pipeline mode (on encoder tracks)."""
+class TestPftracePipelineNoTrackEvents:
+    """Pipeline mode uses only GpuRenderStageEvent — no TrackEvent tracks."""
 
-    def test_barrier_count(self):
+    def test_no_track_events(self):
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline")
         trace = _parse_trace(raw)
-        barriers = [
-            p for p in _track_events(trace)
-            if p.track_event.type == pb.TrackEvent.TYPE_INSTANT
-        ]
-        assert len(barriers) == 1
+        assert len(_track_events(trace)) == 0
 
-    def test_barrier_on_encoder_track(self):
-        """Barriers land on the encoder track they belong to, not a dedicated track."""
+    def test_no_track_descriptors(self):
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline")
         trace = _parse_trace(raw)
-        barriers = [
-            p for p in _track_events(trace)
-            if p.track_event.type == pb.TrackEvent.TYPE_INSTANT
-        ]
-        # Barrier is on encoder 0 → _PIPELINE_ENCODER_TRACK_BASE + 0 = 200
-        assert barriers[0].track_event.track_uuid == 200
-
-    def test_barrier_name(self):
-        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline")
-        trace = _parse_trace(raw)
-        barriers = [
-            p for p in _track_events(trace)
-            if p.track_event.type == pb.TrackEvent.TYPE_INSTANT
-        ]
-        assert barriers[0].track_event.name == "barrier (buffers)"
-
-    def test_barrier_debug_annotations(self):
-        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline")
-        trace = _parse_trace(raw)
-        barriers = [
-            p for p in _track_events(trace)
-            if p.track_event.type == pb.TrackEvent.TYPE_INSTANT
-        ]
-        annotations = {
-            da.name: (da.string_value or da.int_value)
-            for da in barriers[0].track_event.debug_annotations
-        }
-        assert annotations["scope"] == "buffers"
-        assert annotations["cb"] == 0
-
-
-# -----------------------------------------------------------------------
-# Pipeline mode — encoder spans
-# -----------------------------------------------------------------------
-
-
-class TestPftracePipelineEncoderSpans:
-    """TrackEvent SLICE_BEGIN/END for encoder spans in pipeline mode."""
-
-    def test_encoder_span_count(self):
-        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline")
-        trace = _parse_trace(raw)
-        begins = [
-            p for p in _track_events(trace)
-            if p.track_event.type == pb.TrackEvent.TYPE_SLICE_BEGIN
-        ]
-        ends = [
-            p for p in _track_events(trace)
-            if p.track_event.type == pb.TrackEvent.TYPE_SLICE_END
-        ]
-        assert len(begins) == 3  # 3 encoders
-        assert len(ends) == 3
-
-    def test_encoder_span_timestamps(self):
-        data = _make_trace_data(
-            events=[
-                {"type": "dispatch", "kernel": "k", "index": 5, "encoder_idx": 0},
-                {"type": "dispatch", "kernel": "k", "index": 10, "encoder_idx": 0},
-            ],
-            command_buffers=[{"func_idx": 15}],
-            compute_encoders=[{"encoder_idx": 0, "command_buffer_idx": 0, "addr": "0xe0"}],
-        )
-        raw = timeline_to_pftrace(data, group_by="pipeline")
-        trace = _parse_trace(raw)
-        begins = [
-            p for p in _track_events(trace)
-            if p.track_event.type == pb.TrackEvent.TYPE_SLICE_BEGIN
-        ]
-        ends = [
-            p for p in _track_events(trace)
-            if p.track_event.type == pb.TrackEvent.TYPE_SLICE_END
-        ]
-        assert begins[0].timestamp == 5000  # lo * 1000
-        assert ends[0].timestamp == 11000  # (hi + 1) * 1000
-
-    def test_encoder_span_name(self):
-        data = _make_trace_data(
-            events=[
-                {"type": "dispatch", "kernel": "k", "index": 1, "encoder_idx": 0},
-            ],
-            command_buffers=[{"func_idx": 5}],
-            compute_encoders=[{"encoder_idx": 0, "command_buffer_idx": 0, "addr": "0xe0"}],
-        )
-        raw = timeline_to_pftrace(data, group_by="pipeline")
-        trace = _parse_trace(raw)
-        begins = [
-            p for p in _track_events(trace)
-            if p.track_event.type == pb.TrackEvent.TYPE_SLICE_BEGIN
-        ]
-        assert "Encoder #0" in begins[0].track_event.name
-        assert "(0xe0)" in begins[0].track_event.name
-
-    def test_encoder_track_uuid(self):
-        data = _make_trace_data(
-            events=[
-                {"type": "dispatch", "kernel": "k", "index": 1, "encoder_idx": 0},
-            ],
-            command_buffers=[{"func_idx": 5}],
-            compute_encoders=[{"encoder_idx": 0, "command_buffer_idx": 0}],
-        )
-        raw = timeline_to_pftrace(data, group_by="pipeline")
-        trace = _parse_trace(raw)
-        begins = [
-            p for p in _track_events(trace)
-            if p.track_event.type == pb.TrackEvent.TYPE_SLICE_BEGIN
-        ]
-        assert begins[0].track_event.track_uuid == 200  # _PIPELINE_ENCODER_TRACK_BASE + 0
+        assert len(_track_descriptors(trace)) == 0
 
 
 # -----------------------------------------------------------------------
@@ -433,38 +324,17 @@ class TestPftracePipelineComplex:
     def test_packet_count(self):
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline")
         trace = _parse_trace(raw)
-        # Should have: 1 intern + 5 GPU events + process TD + 3 encoder TDs
-        # + 1 barrier TE + 3 encoder begin + 3 encoder end = 16 packets
-        assert len(trace.packet) >= 16
+        # 1 intern packet + 5 GPU event packets = 6
+        assert len(trace.packet) == 6
 
-    def test_no_track_event_dispatches(self):
-        """Pipeline mode uses GpuRenderStageEvent for dispatches, not TrackEvent slices."""
+    def test_only_gpu_and_intern_packets(self):
+        """Pipeline mode has only GpuRenderStageEvent + InternedData packets."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline")
         trace = _parse_trace(raw)
-        # TrackEvent slices should be encoder spans only, not dispatch slices
-        begins = [
-            p for p in _track_events(trace)
-            if p.track_event.type == pb.TrackEvent.TYPE_SLICE_BEGIN
-        ]
-        for b in begins:
-            assert "Encoder" in b.track_event.name
-
-    def test_track_hierarchy(self):
-        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline")
-        trace = _parse_trace(raw)
-        tds = _track_descriptors(trace)
-
-        # Process track exists
-        process_tds = [t for t in tds if t.track_descriptor.HasField("process")]
-        assert len(process_tds) == 1
-        assert process_tds[0].track_descriptor.uuid == 1  # _PIPELINE_PROCESS_UUID
-
-        # Encoder tracks are children of the process (no dedicated barrier track)
-        child_tds = [
-            t for t in tds
-            if t.track_descriptor.parent_uuid == 1
-        ]
-        assert len(child_tds) == 3  # 3 encoders
+        assert len(_gpu_events(trace)) == 5
+        assert len(_interned_data_pkts(trace)) == 1
+        assert len(_track_events(trace)) == 0
+        assert len(_track_descriptors(trace)) == 0
 
 
 # -----------------------------------------------------------------------
