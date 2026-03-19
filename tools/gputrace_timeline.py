@@ -608,44 +608,61 @@ def _replay_gputrace(gputrace_path: str, timeout: int = 120) -> str | None:
     import time
     time.sleep(3)  # Wait for Xcode to load the capture
 
-    # Click the Replay button via JXA accessibility
+    # Ensure "Profile after replay" is checked, then click Replay via JXA
     jxa_script = '''
-const se = Application("System Events");
-const xcode = se.processes["Xcode"];
+var se = Application("System Events");
+var xcode = se.processes["Xcode"];
 Application("Xcode").activate();
 delay(0.5);
 
-function findButton(element, name, depth) {
+function findElement(element, role, name, depth) {
     if (depth > 15) return null;
     try {
-        const buttons = element.buttons.whose({name: name})();
-        if (buttons.length > 0) return buttons[0];
+        var items;
+        if (role === "AXButton") items = element.buttons.whose({name: name})();
+        else if (role === "AXCheckBox") items = element.checkboxes.whose({name: name})();
+        if (items && items.length > 0) return items[0];
     } catch(e) {}
     try {
-        const splitGroups = element.splitterGroups();
-        for (let sg of splitGroups) {
-            const found = findButton(sg, name, depth + 1);
+        var sgs = element.splitterGroups();
+        for (var i = 0; i < sgs.length; i++) {
+            var found = findElement(sgs[i], role, name, depth + 1);
             if (found) return found;
         }
     } catch(e) {}
     try {
-        const groups = element.groups();
-        for (let g of groups) {
-            const found = findButton(g, name, depth + 1);
+        var gs = element.groups();
+        for (var i = 0; i < gs.length; i++) {
+            var found = findElement(gs[i], role, name, depth + 1);
             if (found) return found;
         }
     } catch(e) {}
     return null;
 }
 
-const win = xcode.windows[0];
-const btn = findButton(win, "Replay", 0);
+var win = xcode.windows[0];
+var msg = "";
+
+var cb = findElement(win, "AXCheckBox", "Profile after replay", 0);
+if (cb) {
+    if (cb.value() != 1) {
+        cb.click();
+        msg += "Enabled profiling. ";
+    } else {
+        msg += "Profiling already enabled. ";
+    }
+} else {
+    msg += "WARN: Profile checkbox not found. ";
+}
+
+var btn = findElement(win, "AXButton", "Replay", 0);
 if (btn) {
     btn.click();
-    "OK";
+    msg += "Clicked Replay.";
 } else {
-    "ERROR: Could not find Replay button";
+    msg = "ERROR: Could not find Replay button";
 }
+msg;
 '''
 
     try:
@@ -662,27 +679,45 @@ if (btn) {
         log.warning("Replay button not found: %s", result)
         return None
 
-    log.info("Clicked Replay — waiting for profiling to complete...")
+    log.info("%s — waiting for profiling to complete...", result)
 
-    # Poll for streamData to appear
+    # Snapshot existing streamData files and their mtimes
     profiling_dir = Path(_XCODE_PROFILING_DIR)
-    before = set(profiling_dir.glob("*.gpuprofiler_raw")) if profiling_dir.exists() else set()
+    before_dirs = set()
+    before_mtimes: dict[str, float] = {}
+    if profiling_dir.exists():
+        for d in profiling_dir.glob("*.gpuprofiler_raw"):
+            before_dirs.add(d)
+            sd = d / "streamData"
+            if sd.exists():
+                before_mtimes[str(sd)] = sd.stat().st_mtime
 
     for i in range(timeout):
         time.sleep(1)
         if not profiling_dir.exists():
             continue
 
-        after = set(profiling_dir.glob("*.gpuprofiler_raw"))
-        new_dirs = after - before
-        for d in new_dirs:
+        for d in profiling_dir.glob("*.gpuprofiler_raw"):
             sd = d / "streamData"
-            if sd.exists() and sd.stat().st_size > 0:
+            if not sd.exists() or sd.stat().st_size == 0:
+                continue
+
+            sd_str = str(sd)
+            cur_mtime = sd.stat().st_mtime
+
+            # New dir, or existing streamData with updated mtime
+            is_new = d not in before_dirs
+            is_updated = (
+                sd_str in before_mtimes
+                and cur_mtime > before_mtimes[sd_str]
+            )
+
+            if is_new or is_updated:
                 log.info(
                     "Profiling complete after %ds: %s (%d bytes)",
                     i + 1, sd, sd.stat().st_size,
                 )
-                return str(sd)
+                return sd_str
 
         if i % 15 == 14:
             log.info("  ... still waiting (%ds)", i + 1)
