@@ -977,6 +977,11 @@ def main() -> None:
         help="Include GPU performance counter tracks (requires shader profiling data)",
     )
     parser.add_argument(
+        "--replay", action="store_true",
+        help="If no counter data found, open gputrace in Xcode and click "
+             "Replay to trigger shader profiling (requires accessibility permissions)",
+    )
+    parser.add_argument(
         "--open", action="store_true",
         help="Open ui.perfetto.dev in browser after export",
     )
@@ -1003,7 +1008,9 @@ def main() -> None:
             log.warning("--counters is only supported with --format pftrace; ignoring")
         else:
             from gputrace_timeline import read_gputrace_counters
-            counter_data = read_gputrace_counters(args.gputrace)
+            counter_data = read_gputrace_counters(
+                args.gputrace, replay=args.replay,
+            )
             if counter_data is not None:
                 # Filter to non-zero counters for summary
                 num_counters = len(counter_data["counter_names"])

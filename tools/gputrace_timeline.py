@@ -541,8 +541,167 @@ def _load_profiler_frameworks() -> bool:
     return True
 
 
-def read_gputrace_counters(gputrace_path: str) -> dict[str, Any] | None:
+_XCODE_PROFILING_DIR = "/private/tmp/com.apple.gputools.profiling"
+
+
+def _find_stream_data(gputrace_path: str) -> str | None:
+    """Find streamData for a gputrace, checking bundle and Xcode temp dir.
+
+    Searches:
+      1. Inside the gputrace bundle: <bundle>/*.gpuprofiler_raw/streamData
+      2. Xcode profiling temp dir: /private/tmp/com.apple.gputools.profiling/
+         using the gputrace stem name to match (e.g. sprux_ffi_stream.gpuprofiler_raw)
+    """
+    # 1. Inside the gputrace bundle
+    pattern = os.path.join(gputrace_path, "*.gpuprofiler_raw", "streamData")
+    matches = globmod.glob(pattern)
+    if matches:
+        return matches[0]
+
+    # 2. Xcode profiling temp dir — match by gputrace stem name
+    stem = os.path.splitext(os.path.basename(gputrace_path))[0]
+    candidates = [
+        f"{stem}_stream.gpuprofiler_raw",  # e.g. sprux_ffi_stream.gpuprofiler_raw
+        f"{stem}.gpuprofiler_raw",
+    ]
+    for candidate in candidates:
+        sd = os.path.join(_XCODE_PROFILING_DIR, candidate, "streamData")
+        if os.path.exists(sd):
+            return sd
+
+    # 3. Glob the temp dir for any match containing the stem
+    if os.path.isdir(_XCODE_PROFILING_DIR):
+        pattern = os.path.join(
+            _XCODE_PROFILING_DIR, f"*{stem}*.gpuprofiler_raw", "streamData",
+        )
+        matches = globmod.glob(pattern)
+        if matches:
+            return matches[0]
+
+    return None
+
+
+def _replay_gputrace(gputrace_path: str, timeout: int = 120) -> str | None:
+    """Open gputrace in Xcode and click Replay to trigger shader profiling.
+
+    Uses JXA (JavaScript for Automation) via osascript to:
+      1. Open the gputrace in Xcode
+      2. Wait for it to load
+      3. Find and click the "Replay" button
+      4. Poll for streamData to appear
+
+    Returns path to streamData if successful, None otherwise.
+    """
+    import subprocess
+    from pathlib import Path
+
+    abs_path = os.path.abspath(gputrace_path)
+    log.info("Opening %s in Xcode for replay...", abs_path)
+
+    # Open the gputrace in Xcode
+    try:
+        subprocess.run(["open", "-a", "Xcode", abs_path], check=True, timeout=10)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        log.warning("Failed to open gputrace in Xcode: %s", e)
+        return None
+
+    import time
+    time.sleep(3)  # Wait for Xcode to load the capture
+
+    # Click the Replay button via JXA accessibility
+    jxa_script = '''
+const se = Application("System Events");
+const xcode = se.processes["Xcode"];
+Application("Xcode").activate();
+delay(0.5);
+
+function findButton(element, name, depth) {
+    if (depth > 15) return null;
+    try {
+        const buttons = element.buttons.whose({name: name})();
+        if (buttons.length > 0) return buttons[0];
+    } catch(e) {}
+    try {
+        const splitGroups = element.splitterGroups();
+        for (let sg of splitGroups) {
+            const found = findButton(sg, name, depth + 1);
+            if (found) return found;
+        }
+    } catch(e) {}
+    try {
+        const groups = element.groups();
+        for (let g of groups) {
+            const found = findButton(g, name, depth + 1);
+            if (found) return found;
+        }
+    } catch(e) {}
+    return null;
+}
+
+const win = xcode.windows[0];
+const btn = findButton(win, "Replay", 0);
+if (btn) {
+    btn.click();
+    "OK";
+} else {
+    "ERROR: Could not find Replay button";
+}
+'''
+
+    try:
+        result = subprocess.check_output(
+            ["osascript", "-l", "JavaScript", "-e", jxa_script],
+            stderr=subprocess.STDOUT, timeout=30,
+        ).decode().strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        out = e.output.decode() if hasattr(e, "output") and e.output else str(e)
+        log.warning("Failed to click Replay: %s", out)
+        return None
+
+    if "ERROR" in result:
+        log.warning("Replay button not found: %s", result)
+        return None
+
+    log.info("Clicked Replay — waiting for profiling to complete...")
+
+    # Poll for streamData to appear
+    profiling_dir = Path(_XCODE_PROFILING_DIR)
+    before = set(profiling_dir.glob("*.gpuprofiler_raw")) if profiling_dir.exists() else set()
+
+    for i in range(timeout):
+        time.sleep(1)
+        if not profiling_dir.exists():
+            continue
+
+        after = set(profiling_dir.glob("*.gpuprofiler_raw"))
+        new_dirs = after - before
+        for d in new_dirs:
+            sd = d / "streamData"
+            if sd.exists() and sd.stat().st_size > 0:
+                log.info(
+                    "Profiling complete after %ds: %s (%d bytes)",
+                    i + 1, sd, sd.stat().st_size,
+                )
+                return str(sd)
+
+        if i % 15 == 14:
+            log.info("  ... still waiting (%ds)", i + 1)
+
+    log.warning("Profiling did not complete within %ds", timeout)
+    return None
+
+
+def read_gputrace_counters(
+    gputrace_path: str,
+    *,
+    replay: bool = False,
+    replay_timeout: int = 120,
+) -> dict[str, Any] | None:
     """Extract derived GPU performance counter samples from streamData.
+
+    Searches for streamData in the gputrace bundle and Xcode's temp
+    profiling directory. If not found and replay=True, opens the
+    gputrace in Xcode and clicks Replay to trigger shader profiling.
 
     Requires GTShaderProfiler.framework (loaded from GPUDebugger.ideplugin).
     Returns None if streamData is missing or frameworks unavailable.
@@ -554,14 +713,19 @@ def read_gputrace_counters(gputrace_path: str) -> dict[str, Any] | None:
       samples        - list of lists: samples[i][j] = float value for
                        sample i, counter j
     """
-    # Find streamData inside the gputrace bundle
-    pattern = os.path.join(gputrace_path, "*.gpuprofiler_raw", "streamData")
-    matches = globmod.glob(pattern)
-    if not matches:
-        log.info("No streamData found in %s (shader profiling not enabled?)", gputrace_path)
+    stream_path = _find_stream_data(gputrace_path)
+
+    if stream_path is None and replay:
+        log.info("No existing streamData — triggering Xcode replay...")
+        stream_path = _replay_gputrace(gputrace_path, timeout=replay_timeout)
+
+    if stream_path is None:
+        log.info(
+            "No streamData found. Use --replay to trigger Xcode replay, "
+            "or replay manually in Xcode with shader profiling enabled.",
+        )
         return None
 
-    stream_path = matches[0]
     log.info("Found streamData: %s", stream_path)
 
     # Load profiler frameworks
