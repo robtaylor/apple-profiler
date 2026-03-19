@@ -750,6 +750,9 @@ def read_gputrace_counters(
     """
     stream_path = _find_stream_data(gputrace_path)
 
+    if stream_path is not None:
+        log.info("Found existing streamData: %s", stream_path)
+
     if stream_path is None and replay:
         log.info("No existing streamData — triggering Xcode replay...")
         stream_path = _replay_gputrace(gputrace_path, timeout=replay_timeout)
@@ -760,8 +763,6 @@ def read_gputrace_counters(
             "or replay manually in Xcode with shader profiling enabled.",
         )
         return None
-
-    log.info("Found streamData: %s", stream_path)
 
     # Load profiler frameworks
     if not _load_profiler_frameworks():
@@ -817,7 +818,20 @@ def read_gputrace_counters(
     # Extract counter names
     names_ns = agg.derivedCounterNames()
     if names_ns is None or names_ns.count() == 0:
-        log.info("No derived counter names found")
+        if replay:
+            log.info(
+                "Existing streamData has no counter data "
+                "(profiledState=%s) — triggering Xcode replay...",
+                tl_info.profiledState(),
+            )
+            new_path = _replay_gputrace(gputrace_path, timeout=replay_timeout)
+            if new_path is not None:
+                # Retry once with replay=False to avoid infinite recursion
+                return read_gputrace_counters(
+                    gputrace_path, replay=False,
+                    replay_timeout=replay_timeout,
+                )
+        log.info("No derived counter names found in streamData")
         return None
 
     counter_names: list[str] = []
