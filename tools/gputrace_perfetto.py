@@ -113,6 +113,22 @@ def _dispatch_args(event: dict[str, Any]) -> dict[str, Any]:
     return args
 
 
+def _build_duration_map(events: list[dict[str, Any]]) -> dict[int, int]:
+    """Map each event's func_idx to its duration (units = func_idx delta).
+
+    Each event lasts until the next event in the stream. The last event
+    gets a duration of 1. This mirrors Xcode's timeline display.
+    """
+    indices = sorted({ev.get("index", 0) for ev in events})
+    dur: dict[int, int] = {}
+    for i, idx in enumerate(indices):
+        if i + 1 < len(indices):
+            dur[idx] = indices[i + 1] - idx
+        else:
+            dur[idx] = 1
+    return dur
+
+
 def _update_range(
     ranges: dict[int, tuple[int, int]], key: int, value: int,
 ) -> None:
@@ -442,7 +458,6 @@ def timeline_to_pftrace(
 
 # Stable UUIDs for pipeline mode tracks
 _PIPELINE_PROCESS_UUID = 1
-_PIPELINE_BARRIER_TRACK_UUID = 100
 _PIPELINE_ENCODER_TRACK_BASE = 200  # encoder N -> 200+N
 
 # Sequence IDs (one per "writer" — GPU events vs TrackEvents)
@@ -500,6 +515,9 @@ def _pftrace_pipeline(data: dict[str, Any]) -> bytes:
     stage_spec.category = pb.InternedGpuRenderStageSpecification.COMPUTE
 
     # -- 2. GpuRenderStageEvent packets (dispatches) -----------------------
+    # Duration: each event lasts until the next event (Xcode-style).
+    dur_map = _build_duration_map(data.get("events", []))
+
     event_id = 0
     for ev in data.get("events", []):
         if ev.get("type") != "dispatch":
@@ -519,7 +537,7 @@ def _pftrace_pipeline(data: dict[str, Any]) -> bytes:
         event_id += 1
         gpu.hw_queue_iid = kernel_to_iid[kernel] + 1  # 1-based
         gpu.stage_iid = STAGE_IID
-        gpu.duration = 1000  # 1µs in ns
+        gpu.duration = dur_map.get(func_idx, 1) * 1000  # ns
         gpu.submission_id = cb_idx
 
         # command_buffer_handle is uint64 — parse hex addr
@@ -559,7 +577,7 @@ def _pftrace_pipeline(data: dict[str, Any]) -> bytes:
         ed.name = "cb"
         ed.value = str(cb_idx)
 
-    # -- 3. TrackDescriptor packets (process + barrier/encoder tracks) ------
+    # -- 3. TrackDescriptor packets (process + encoder tracks) --------------
 
     # Process track
     proc_td = trace.packet.add()
@@ -568,13 +586,6 @@ def _pftrace_pipeline(data: dict[str, Any]) -> bytes:
     proc_td.track_descriptor.name = "GPU Compute"
     proc_td.track_descriptor.process.pid = 1
     proc_td.track_descriptor.process.process_name = "GPU Compute"
-
-    # Barrier track
-    barrier_td = trace.packet.add()
-    barrier_td.trusted_packet_sequence_id = _TRACK_SEQ
-    barrier_td.track_descriptor.uuid = _PIPELINE_BARRIER_TRACK_UUID
-    barrier_td.track_descriptor.parent_uuid = _PIPELINE_PROCESS_UUID
-    barrier_td.track_descriptor.name = "Barriers"
 
     # Encoder tracks + func_idx ranges
     enc_func_ranges: dict[int, tuple[int, int]] = {}
@@ -603,7 +614,7 @@ def _pftrace_pipeline(data: dict[str, Any]) -> bytes:
         label += f" [CB {cb_idx}]"
         enc_td.track_descriptor.name = label
 
-    # -- 4. TrackEvent — barriers (TYPE_INSTANT) ----------------------------
+    # -- 4. TrackEvent — barriers on encoder tracks (TYPE_INSTANT) ----------
     first_track_event = True
 
     for ev in data.get("events", []):
@@ -624,16 +635,12 @@ def _pftrace_pipeline(data: dict[str, Any]) -> bytes:
 
         te = pkt.track_event
         te.type = pb.TrackEvent.TYPE_INSTANT
-        te.track_uuid = _PIPELINE_BARRIER_TRACK_UUID
+        te.track_uuid = _PIPELINE_ENCODER_TRACK_BASE + enc_idx
         te.name = f"barrier ({scope})"
 
         da = te.debug_annotations.add()
         da.name = "scope"
         da.string_value = scope
-
-        da = te.debug_annotations.add()
-        da.name = "encoder"
-        da.int_value = enc_idx
 
         da = te.debug_annotations.add()
         da.name = "cb"
@@ -765,6 +772,9 @@ def _pftrace_cb(data: dict[str, Any]) -> bytes:
         enc_pkt.track_descriptor.name = label
 
     # -- 2. Dispatch slices + barrier instants on encoder tracks ------------
+    # Duration: each event lasts until the next event (Xcode-style).
+    dur_map = _build_duration_map(data.get("events", []))
+
     first_event = True
     for ev in data.get("events", []):
         etype = ev.get("type")
@@ -774,6 +784,7 @@ def _pftrace_cb(data: dict[str, Any]) -> bytes:
 
         if etype == "dispatch":
             kernel = ev.get("kernel", "unknown")
+            dur = dur_map.get(func_idx, 1)
 
             # SLICE_BEGIN
             begin_pkt = trace.packet.add()
@@ -819,7 +830,7 @@ def _pftrace_cb(data: dict[str, Any]) -> bytes:
 
             # SLICE_END
             end_pkt = trace.packet.add()
-            end_pkt.timestamp = (func_idx + 1) * 1000
+            end_pkt.timestamp = (func_idx + dur) * 1000
             end_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
             end_te = end_pkt.track_event
             end_te.type = pb.TrackEvent.TYPE_SLICE_END

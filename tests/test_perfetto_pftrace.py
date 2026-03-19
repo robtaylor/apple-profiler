@@ -171,12 +171,29 @@ class TestPftracePipelineDispatches:
         stage_iids = {p.gpu_render_stage_event.stage_iid for p in gpu}
         assert stage_iids == {100}
 
-    def test_dispatch_duration(self):
-        raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline")
+    def test_dispatch_duration_fills_to_next_event(self):
+        """Duration extends to the next event's func_idx (Xcode-style)."""
+        data = _make_trace_data(
+            events=[
+                {"type": "dispatch", "kernel": "k1", "index": 1, "encoder_idx": 0},
+                {"type": "dispatch", "kernel": "k2", "index": 5, "encoder_idx": 0},
+                {"type": "dispatch", "kernel": "k3", "index": 6, "encoder_idx": 0},
+            ],
+            command_buffers=[{"func_idx": 10}],
+            compute_encoders=[{"encoder_idx": 0, "command_buffer_idx": 0}],
+        )
+        raw = timeline_to_pftrace(data, group_by="pipeline")
         trace = _parse_trace(raw)
         gpu = _gpu_events(trace)
-        for p in gpu:
-            assert p.gpu_render_stage_event.duration == 1000  # 1µs in ns
+        durations = sorted(
+            (p.timestamp, p.gpu_render_stage_event.duration) for p in gpu
+        )
+        # idx=1 → next=5 → dur=4*1000=4000ns
+        assert durations[0] == (1000, 4000)
+        # idx=5 → next=6 → dur=1*1000=1000ns
+        assert durations[1] == (5000, 1000)
+        # idx=6 → last → dur=1*1000=1000ns
+        assert durations[2] == (6000, 1000)
 
     def test_dispatch_timestamp(self):
         data = _make_trace_data(
@@ -239,7 +256,7 @@ class TestPftracePipelineDispatches:
 
 
 class TestPftracePipelineBarriers:
-    """TrackEvent TYPE_INSTANT for barriers in pipeline mode."""
+    """TrackEvent TYPE_INSTANT for barriers in pipeline mode (on encoder tracks)."""
 
     def test_barrier_count(self):
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline")
@@ -250,14 +267,16 @@ class TestPftracePipelineBarriers:
         ]
         assert len(barriers) == 1
 
-    def test_barrier_on_barrier_track(self):
+    def test_barrier_on_encoder_track(self):
+        """Barriers land on the encoder track they belong to, not a dedicated track."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline")
         trace = _parse_trace(raw)
         barriers = [
             p for p in _track_events(trace)
             if p.track_event.type == pb.TrackEvent.TYPE_INSTANT
         ]
-        assert barriers[0].track_event.track_uuid == 100  # _PIPELINE_BARRIER_TRACK_UUID
+        # Barrier is on encoder 0 → _PIPELINE_ENCODER_TRACK_BASE + 0 = 200
+        assert barriers[0].track_event.track_uuid == 200
 
     def test_barrier_name(self):
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline")
@@ -280,7 +299,6 @@ class TestPftracePipelineBarriers:
             for da in barriers[0].track_event.debug_annotations
         }
         assert annotations["scope"] == "buffers"
-        assert annotations["encoder"] == 0
         assert annotations["cb"] == 0
 
 
@@ -415,9 +433,9 @@ class TestPftracePipelineComplex:
     def test_packet_count(self):
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline")
         trace = _parse_trace(raw)
-        # Should have: 1 intern + 5 GPU events + process TD + barrier TD + 3 encoder TDs
-        # + 1 barrier TE + 3 encoder begin + 3 encoder end = 17 packets
-        assert len(trace.packet) >= 17
+        # Should have: 1 intern + 5 GPU events + process TD + 3 encoder TDs
+        # + 1 barrier TE + 3 encoder begin + 3 encoder end = 16 packets
+        assert len(trace.packet) >= 16
 
     def test_no_track_event_dispatches(self):
         """Pipeline mode uses GpuRenderStageEvent for dispatches, not TrackEvent slices."""
@@ -441,12 +459,12 @@ class TestPftracePipelineComplex:
         assert len(process_tds) == 1
         assert process_tds[0].track_descriptor.uuid == 1  # _PIPELINE_PROCESS_UUID
 
-        # Barrier + encoder tracks are children of the process
+        # Encoder tracks are children of the process (no dedicated barrier track)
         child_tds = [
             t for t in tds
             if t.track_descriptor.parent_uuid == 1
         ]
-        assert len(child_tds) == 4  # 1 barrier + 3 encoders
+        assert len(child_tds) == 3  # 3 encoders
 
 
 # -----------------------------------------------------------------------
