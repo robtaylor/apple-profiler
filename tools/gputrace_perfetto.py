@@ -3,12 +3,14 @@
 # dependencies = [
 #     "pyobjc-core",
 #     "pyobjc-framework-Cocoa",
+#     "perfetto",
 # ]
 # ///
-"""Export GPU trace timeline as Chrome Trace Event JSON for Perfetto.
+"""Export GPU trace timeline as Perfetto-compatible trace files.
 
 Reads a .gputrace file via gputrace_timeline.read_gputrace() and outputs
-a Chrome Trace Event Format JSON file that can be loaded in ui.perfetto.dev.
+either Chrome Trace Event JSON or Perfetto protobuf (.pftrace) format,
+both loadable in ui.perfetto.dev.
 
 Since there are no wall-clock timestamps in the trace (only func_idx ordering),
 timestamps are synthesized: each dispatch/barrier occupies a 1µs slot at
@@ -17,17 +19,28 @@ ts = func_idx. This preserves ordering and produces a readable timeline.
 Two grouping modes:
 
   --group-by pipeline  (default)
-    Process = compute pipeline (kernel name). Each unique kernel gets its own
-    track group; dispatches appear chronologically within. Barriers appear on
-    a dedicated "Barriers" track.
+    JSON: Process = kernel name, dispatches chronological, barriers on dedicated track.
+    pftrace: GpuRenderStageEvent for dispatches (Perfetto GPU UI), TrackEvent for
+    barriers/encoder spans.
 
   --group-by cb
-    Process = command buffer index, Thread = encoder index.
-    Shows the hardware submission structure.
+    JSON: Process = CB index, Thread = encoder index.
+    pftrace: All TrackEvent — process per CB, child tracks per encoder.
+
+Two output formats:
+
+  --format json  (default)
+    Chrome Trace Event Format JSON.
+
+  --format pftrace
+    Perfetto protobuf binary. GpuRenderStageEvent gets dedicated GPU UI treatment
+    in Perfetto (pipeline mode only).
 
 Usage:
     uv run tools/gputrace_perfetto.py <path.gputrace> [-o output.json] [--open]
     uv run tools/gputrace_perfetto.py <path.gputrace> --group-by cb
+    uv run tools/gputrace_perfetto.py <path.gputrace> --format pftrace
+    uv run tools/gputrace_perfetto.py <path.gputrace> --format pftrace --group-by cb
 """
 from __future__ import annotations
 
@@ -402,23 +415,519 @@ def _group_by_cb(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
 
 
 # ---------------------------------------------------------------------------
+# Perfetto protobuf (.pftrace) export
+# ---------------------------------------------------------------------------
+
+
+def timeline_to_pftrace(
+    data: dict[str, Any],
+    group_by: str = "pipeline",
+) -> bytes:
+    """Convert read_gputrace() output to Perfetto protobuf (.pftrace) format.
+
+    Args:
+        data: Output from read_gputrace().
+        group_by: "pipeline" uses GpuRenderStageEvent for dispatches (GPU UI),
+                  "cb" uses all TrackEvent (process per CB).
+
+    Returns serialized protobuf bytes suitable for writing to a .pftrace file.
+    """
+    if group_by == "pipeline":
+        return _pftrace_pipeline(data)
+    elif group_by == "cb":
+        return _pftrace_cb(data)
+    else:
+        raise ValueError(f"Unknown group_by mode: {group_by!r}")
+
+
+# Stable UUIDs for pipeline mode tracks
+_PIPELINE_PROCESS_UUID = 1
+_PIPELINE_BARRIER_TRACK_UUID = 100
+_PIPELINE_ENCODER_TRACK_BASE = 200  # encoder N -> 200+N
+
+# Sequence IDs (one per "writer" — GPU events vs TrackEvents)
+_GPU_SEQ = 1
+_TRACK_SEQ = 2
+
+
+def _pftrace_pipeline(data: dict[str, Any]) -> bytes:
+    """Pipeline-grouped pftrace: GpuRenderStageEvent dispatches + TrackEvent barriers/spans."""
+    from perfetto.protos.perfetto.trace import perfetto_trace_pb2 as pb
+
+    trace = pb.Trace()
+
+    # -- Mappings -----------------------------------------------------------
+    encoder_to_cb: dict[int, int] = {}
+    for enc in data.get("compute_encoders", []):
+        encoder_to_cb[enc["encoder_idx"]] = enc.get("command_buffer_idx", 0)
+
+    cb_addrs: dict[int, str] = {}
+    for cb_idx, cb in enumerate(data.get("command_buffers", [])):
+        if cb.get("addr"):
+            cb_addrs[cb_idx] = cb["addr"]
+
+    # Collect unique kernels in first-appearance order for hw_queue interning
+    kernel_order: list[str] = []
+    kernel_to_iid: dict[str, int] = {}
+    for ev in data.get("events", []):
+        if ev.get("type") == "dispatch":
+            k = ev.get("kernel", "unknown")
+            if k not in kernel_to_iid:
+                kernel_to_iid[k] = len(kernel_order)
+                kernel_order.append(k)
+
+    # -- 1. Interned GPU specifications (via InternedData) ------------------
+    STAGE_IID = 100
+
+    intern_pkt = trace.packet.add()
+    intern_pkt.trusted_packet_sequence_id = _GPU_SEQ
+    intern_pkt.timestamp = 0
+    intern_pkt.sequence_flags = 1  # SEQ_INCREMENTAL_STATE_CLEARED
+
+    for kernel_name in kernel_order:
+        iid = kernel_to_iid[kernel_name] + 1  # 1-based
+        spec = intern_pkt.interned_data.gpu_specifications.add()
+        spec.iid = iid
+        spec.name = kernel_name
+        spec.description = f"Compute kernel: {kernel_name}"
+        spec.category = pb.InternedGpuRenderStageSpecification.COMPUTE
+
+    # Stage specification
+    stage_spec = intern_pkt.interned_data.gpu_specifications.add()
+    stage_spec.iid = STAGE_IID
+    stage_spec.name = "Compute Dispatch"
+    stage_spec.description = "Metal compute pipeline dispatch"
+    stage_spec.category = pb.InternedGpuRenderStageSpecification.COMPUTE
+
+    # -- 2. GpuRenderStageEvent packets (dispatches) -----------------------
+    event_id = 0
+    for ev in data.get("events", []):
+        if ev.get("type") != "dispatch":
+            continue
+
+        kernel = ev.get("kernel", "unknown")
+        func_idx = ev.get("index", 0)
+        enc_idx = ev.get("encoder_idx", 0)
+        cb_idx = encoder_to_cb.get(enc_idx, 0)
+
+        pkt = trace.packet.add()
+        pkt.timestamp = func_idx * 1000  # ns
+        pkt.trusted_packet_sequence_id = _GPU_SEQ
+
+        gpu = pkt.gpu_render_stage_event
+        gpu.event_id = event_id
+        event_id += 1
+        gpu.hw_queue_iid = kernel_to_iid[kernel] + 1  # 1-based
+        gpu.stage_iid = STAGE_IID
+        gpu.duration = 1000  # 1µs in ns
+        gpu.submission_id = cb_idx
+
+        # command_buffer_handle is uint64 — parse hex addr
+        cb_addr = cb_addrs.get(cb_idx, "0x0")
+        gpu.command_buffer_handle = int(cb_addr, 16)
+
+        # Extra data
+        tg = ev.get("threadgroups")
+        if tg:
+            ed = gpu.extra_data.add()
+            ed.name = "threadgroups"
+            ed.value = _format_tuple(tg)
+
+        tpt = ev.get("threads_per_threadgroup")
+        if tpt:
+            ed = gpu.extra_data.add()
+            ed.name = "threads_per_threadgroup"
+            ed.value = _format_tuple(tpt)
+
+        bufs = ev.get("buffers_bound")
+        if bufs:
+            ed = gpu.extra_data.add()
+            ed.name = "buffers_bound"
+            ed.value = str(len(bufs))
+
+        dispatch_type = ev.get("dispatch_type", "")
+        if dispatch_type:
+            ed = gpu.extra_data.add()
+            ed.name = "dispatch_type"
+            ed.value = dispatch_type
+
+        ed = gpu.extra_data.add()
+        ed.name = "encoder"
+        ed.value = str(enc_idx)
+
+        ed = gpu.extra_data.add()
+        ed.name = "cb"
+        ed.value = str(cb_idx)
+
+    # -- 3. TrackDescriptor packets (process + barrier/encoder tracks) ------
+
+    # Process track
+    proc_td = trace.packet.add()
+    proc_td.trusted_packet_sequence_id = _TRACK_SEQ
+    proc_td.track_descriptor.uuid = _PIPELINE_PROCESS_UUID
+    proc_td.track_descriptor.name = "GPU Compute"
+    proc_td.track_descriptor.process.pid = 1
+    proc_td.track_descriptor.process.process_name = "GPU Compute"
+
+    # Barrier track
+    barrier_td = trace.packet.add()
+    barrier_td.trusted_packet_sequence_id = _TRACK_SEQ
+    barrier_td.track_descriptor.uuid = _PIPELINE_BARRIER_TRACK_UUID
+    barrier_td.track_descriptor.parent_uuid = _PIPELINE_PROCESS_UUID
+    barrier_td.track_descriptor.name = "Barriers"
+
+    # Encoder tracks + func_idx ranges
+    enc_func_ranges: dict[int, tuple[int, int]] = {}
+    for ev in data.get("events", []):
+        func_idx = ev.get("index", 0)
+        enc_idx = ev.get("encoder_idx", 0)
+        if enc_idx in enc_func_ranges:
+            lo, hi = enc_func_ranges[enc_idx]
+            enc_func_ranges[enc_idx] = (min(lo, func_idx), max(hi, func_idx))
+        else:
+            enc_func_ranges[enc_idx] = (func_idx, func_idx)
+
+    for enc in data.get("compute_encoders", []):
+        enc_idx = enc["encoder_idx"]
+        cb_idx = enc.get("command_buffer_idx", 0)
+        addr = enc.get("addr", "")
+
+        enc_td = trace.packet.add()
+        enc_td.trusted_packet_sequence_id = _TRACK_SEQ
+        enc_uuid = _PIPELINE_ENCODER_TRACK_BASE + enc_idx
+        enc_td.track_descriptor.uuid = enc_uuid
+        enc_td.track_descriptor.parent_uuid = _PIPELINE_PROCESS_UUID
+        label = f"Encoder #{enc_idx}"
+        if addr:
+            label += f" ({addr})"
+        label += f" [CB {cb_idx}]"
+        enc_td.track_descriptor.name = label
+
+    # -- 4. TrackEvent — barriers (TYPE_INSTANT) ----------------------------
+    first_track_event = True
+
+    for ev in data.get("events", []):
+        if ev.get("type") != "barrier":
+            continue
+
+        scope = ev.get("scope", "buffers")
+        func_idx = ev.get("index", 0)
+        enc_idx = ev.get("encoder_idx", 0)
+        cb_idx = encoder_to_cb.get(enc_idx, 0)
+
+        pkt = trace.packet.add()
+        pkt.timestamp = func_idx * 1000
+        pkt.trusted_packet_sequence_id = _TRACK_SEQ
+        if first_track_event:
+            pkt.sequence_flags = 1  # SEQ_INCREMENTAL_STATE_CLEARED
+            first_track_event = False
+
+        te = pkt.track_event
+        te.type = pb.TrackEvent.TYPE_INSTANT
+        te.track_uuid = _PIPELINE_BARRIER_TRACK_UUID
+        te.name = f"barrier ({scope})"
+
+        da = te.debug_annotations.add()
+        da.name = "scope"
+        da.string_value = scope
+
+        da = te.debug_annotations.add()
+        da.name = "encoder"
+        da.int_value = enc_idx
+
+        da = te.debug_annotations.add()
+        da.name = "cb"
+        da.int_value = cb_idx
+
+    # -- 5. TrackEvent — encoder spans (SLICE_BEGIN / SLICE_END) ------------
+    for enc in data.get("compute_encoders", []):
+        enc_idx = enc["encoder_idx"]
+        if enc_idx not in enc_func_ranges:
+            continue
+
+        lo, hi = enc_func_ranges[enc_idx]
+        enc_uuid = _PIPELINE_ENCODER_TRACK_BASE + enc_idx
+        cb_idx = enc.get("command_buffer_idx", 0)
+        addr = enc.get("addr", "")
+        label = f"Encoder #{enc_idx}"
+        if addr:
+            label += f" ({addr})"
+
+        begin_pkt = trace.packet.add()
+        begin_pkt.timestamp = lo * 1000
+        begin_pkt.trusted_packet_sequence_id = _TRACK_SEQ
+        if first_track_event:
+            begin_pkt.sequence_flags = 1
+            first_track_event = False
+        begin_te = begin_pkt.track_event
+        begin_te.type = pb.TrackEvent.TYPE_SLICE_BEGIN
+        begin_te.track_uuid = enc_uuid
+        begin_te.name = label
+
+        da = begin_te.debug_annotations.add()
+        da.name = "cb"
+        da.int_value = cb_idx
+
+        end_pkt = trace.packet.add()
+        end_pkt.timestamp = (hi + 1) * 1000
+        end_pkt.trusted_packet_sequence_id = _TRACK_SEQ
+        end_te = end_pkt.track_event
+        end_te.type = pb.TrackEvent.TYPE_SLICE_END
+        end_te.track_uuid = enc_uuid
+
+    return trace.SerializeToString()
+
+
+# CB-grouped pftrace UUIDs
+_CB_PROCESS_BASE = 1000    # CB N -> 1000+N
+_CB_OVERVIEW_BASE = 2000   # CB overview N -> 2000+N
+_CB_ENCODER_BASE = 3000    # encoder N -> 3000+N
+_CB_PFTRACE_SEQ = 1
+
+
+def _pftrace_cb(data: dict[str, Any]) -> bytes:
+    """CB-grouped pftrace: all TrackEvent — process per CB, child tracks per encoder."""
+    from perfetto.protos.perfetto.trace import perfetto_trace_pb2 as pb
+
+    trace = pb.Trace()
+
+    # -- Mappings -----------------------------------------------------------
+    encoder_to_cb: dict[int, int] = {}
+    for enc in data.get("compute_encoders", []):
+        encoder_to_cb[enc["encoder_idx"]] = enc.get("command_buffer_idx", 0)
+
+    cb_addrs: dict[int, str] = {}
+    for cb_idx, cb in enumerate(data.get("command_buffers", [])):
+        if cb.get("addr"):
+            cb_addrs[cb_idx] = cb["addr"]
+
+    enc_addrs: dict[int, str] = {}
+    for enc in data.get("compute_encoders", []):
+        if enc.get("addr"):
+            enc_addrs[enc["encoder_idx"]] = enc["addr"]
+
+    # Track func_idx ranges per encoder and CB
+    encoder_func_range: dict[int, tuple[int, int]] = {}
+    cb_func_range: dict[int, tuple[int, int]] = {}
+
+    for ev in data.get("events", []):
+        func_idx = ev.get("index", 0)
+        enc_idx = ev.get("encoder_idx", 0)
+        cb_idx = encoder_to_cb.get(enc_idx, 0)
+
+        if enc_idx in encoder_func_range:
+            lo, hi = encoder_func_range[enc_idx]
+            encoder_func_range[enc_idx] = (min(lo, func_idx), max(hi, func_idx))
+        else:
+            encoder_func_range[enc_idx] = (func_idx, func_idx)
+
+        if cb_idx in cb_func_range:
+            lo, hi = cb_func_range[cb_idx]
+            cb_func_range[cb_idx] = (min(lo, func_idx), max(hi, func_idx))
+        else:
+            cb_func_range[cb_idx] = (func_idx, func_idx)
+
+    # -- 1. TrackDescriptor: process per CB, child tracks per encoder -------
+    for cb_idx in sorted(cb_func_range):
+        addr = cb_addrs.get(cb_idx, "")
+        name = f"CB #{cb_idx}"
+        if addr:
+            name += f" ({addr})"
+
+        proc_pkt = trace.packet.add()
+        proc_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
+        proc_pkt.track_descriptor.uuid = _CB_PROCESS_BASE + cb_idx
+        proc_pkt.track_descriptor.name = name
+        proc_pkt.track_descriptor.process.pid = cb_idx
+        proc_pkt.track_descriptor.process.process_name = name
+
+        # CB overview child track
+        overview_pkt = trace.packet.add()
+        overview_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
+        overview_pkt.track_descriptor.uuid = _CB_OVERVIEW_BASE + cb_idx
+        overview_pkt.track_descriptor.parent_uuid = _CB_PROCESS_BASE + cb_idx
+        overview_pkt.track_descriptor.name = "CB Overview"
+
+    for enc in data.get("compute_encoders", []):
+        enc_idx = enc["encoder_idx"]
+        if enc_idx not in encoder_func_range:
+            continue
+        cb_idx = enc.get("command_buffer_idx", 0)
+        addr = enc.get("addr", "")
+        label = f"Encoder #{enc_idx}"
+        if addr:
+            label += f" ({addr})"
+
+        enc_pkt = trace.packet.add()
+        enc_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
+        enc_pkt.track_descriptor.uuid = _CB_ENCODER_BASE + enc_idx
+        enc_pkt.track_descriptor.parent_uuid = _CB_PROCESS_BASE + cb_idx
+        enc_pkt.track_descriptor.name = label
+
+    # -- 2. Dispatch slices + barrier instants on encoder tracks ------------
+    first_event = True
+    for ev in data.get("events", []):
+        etype = ev.get("type")
+        func_idx = ev.get("index", 0)
+        enc_idx = ev.get("encoder_idx", 0)
+        enc_uuid = _CB_ENCODER_BASE + enc_idx
+
+        if etype == "dispatch":
+            kernel = ev.get("kernel", "unknown")
+
+            # SLICE_BEGIN
+            begin_pkt = trace.packet.add()
+            begin_pkt.timestamp = func_idx * 1000
+            begin_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
+            if first_event:
+                begin_pkt.sequence_flags = 1  # SEQ_INCREMENTAL_STATE_CLEARED
+                first_event = False
+
+            begin_te = begin_pkt.track_event
+            begin_te.type = pb.TrackEvent.TYPE_SLICE_BEGIN
+            begin_te.track_uuid = enc_uuid
+            begin_te.name = kernel
+
+            # Debug annotations for metadata
+            da = begin_te.debug_annotations.add()
+            da.name = "func_idx"
+            da.int_value = func_idx
+
+            tg = ev.get("threadgroups")
+            if tg:
+                da = begin_te.debug_annotations.add()
+                da.name = "threadgroups"
+                da.string_value = _format_tuple(tg)
+
+            tpt = ev.get("threads_per_threadgroup")
+            if tpt:
+                da = begin_te.debug_annotations.add()
+                da.name = "threads_per_threadgroup"
+                da.string_value = _format_tuple(tpt)
+
+            bufs = ev.get("buffers_bound")
+            if bufs:
+                da = begin_te.debug_annotations.add()
+                da.name = "buffers_bound"
+                da.int_value = len(bufs)
+
+            dispatch_type = ev.get("dispatch_type", "")
+            if dispatch_type:
+                da = begin_te.debug_annotations.add()
+                da.name = "dispatch_type"
+                da.string_value = dispatch_type
+
+            # SLICE_END
+            end_pkt = trace.packet.add()
+            end_pkt.timestamp = (func_idx + 1) * 1000
+            end_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
+            end_te = end_pkt.track_event
+            end_te.type = pb.TrackEvent.TYPE_SLICE_END
+            end_te.track_uuid = enc_uuid
+
+        elif etype == "barrier":
+            scope = ev.get("scope", "buffers")
+
+            pkt = trace.packet.add()
+            pkt.timestamp = func_idx * 1000
+            pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
+            if first_event:
+                pkt.sequence_flags = 1
+                first_event = False
+
+            te = pkt.track_event
+            te.type = pb.TrackEvent.TYPE_INSTANT
+            te.track_uuid = enc_uuid
+            te.name = f"barrier ({scope})"
+
+            da = te.debug_annotations.add()
+            da.name = "scope"
+            da.string_value = scope
+
+    # -- 3. Encoder wrapper spans -------------------------------------------
+    for enc in data.get("compute_encoders", []):
+        enc_idx = enc["encoder_idx"]
+        if enc_idx not in encoder_func_range:
+            continue
+
+        lo, hi = encoder_func_range[enc_idx]
+        enc_uuid = _CB_ENCODER_BASE + enc_idx
+        addr = enc.get("addr", "")
+        label = f"Encoder #{enc_idx}"
+        if addr:
+            label += f" ({addr})"
+
+        begin_pkt = trace.packet.add()
+        begin_pkt.timestamp = lo * 1000
+        begin_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
+        if first_event:
+            begin_pkt.sequence_flags = 1
+            first_event = False
+        begin_te = begin_pkt.track_event
+        begin_te.type = pb.TrackEvent.TYPE_SLICE_BEGIN
+        begin_te.track_uuid = enc_uuid
+        begin_te.name = label
+
+        end_pkt = trace.packet.add()
+        end_pkt.timestamp = (hi + 1) * 1000
+        end_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
+        end_te = end_pkt.track_event
+        end_te.type = pb.TrackEvent.TYPE_SLICE_END
+        end_te.track_uuid = enc_uuid
+
+    # -- 4. CB overview spans -----------------------------------------------
+    for cb_idx in sorted(cb_func_range):
+        lo, hi = cb_func_range[cb_idx]
+        overview_uuid = _CB_OVERVIEW_BASE + cb_idx
+        addr = cb_addrs.get(cb_idx, "")
+        label = f"CB #{cb_idx}"
+        if addr:
+            label += f" ({addr})"
+
+        begin_pkt = trace.packet.add()
+        begin_pkt.timestamp = lo * 1000
+        begin_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
+        if first_event:
+            begin_pkt.sequence_flags = 1
+            first_event = False
+        begin_te = begin_pkt.track_event
+        begin_te.type = pb.TrackEvent.TYPE_SLICE_BEGIN
+        begin_te.track_uuid = overview_uuid
+        begin_te.name = label
+
+        end_pkt = trace.packet.add()
+        end_pkt.timestamp = (hi + 1) * 1000
+        end_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
+        end_te = end_pkt.track_event
+        end_te.type = pb.TrackEvent.TYPE_SLICE_END
+        end_te.track_uuid = overview_uuid
+
+    return trace.SerializeToString()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export GPU trace timeline as Chrome Trace Event JSON for Perfetto."
+        description="Export GPU trace timeline as Perfetto-compatible trace file."
     )
     parser.add_argument("gputrace", help="Path to .gputrace file")
     parser.add_argument(
         "-o", "--output",
-        help="Output JSON path (default: <input_stem>_perfetto.json)",
+        help="Output path (default: <input_stem>_perfetto.<ext>)",
     )
     parser.add_argument(
         "--group-by", choices=["pipeline", "cb"], default="pipeline",
         help="Track grouping: 'pipeline' (default) groups by kernel name, "
              "'cb' groups by command buffer/encoder.",
+    )
+    parser.add_argument(
+        "--format", choices=["json", "pftrace"], default="json",
+        help="Output format: 'json' (default) for Chrome Trace Event JSON, "
+             "'pftrace' for Perfetto protobuf binary.",
     )
     parser.add_argument(
         "--open", action="store_true",
@@ -440,18 +949,24 @@ def main() -> None:
         log.error("Failed to read %s", args.gputrace)
         sys.exit(1)
 
-    perfetto = timeline_to_perfetto(trace_data, group_by=args.group_by)
-
+    ext = ".pftrace" if args.format == "pftrace" else ".json"
     output_path = args.output
     if output_path is None:
         stem = Path(args.gputrace).stem
-        output_path = f"{stem}_perfetto.json"
+        output_path = f"{stem}_perfetto{ext}"
 
-    with open(output_path, "w") as f:
-        json.dump(perfetto, f, indent=2)
+    if args.format == "pftrace":
+        trace_bytes = timeline_to_pftrace(trace_data, group_by=args.group_by)
+        with open(output_path, "wb") as f:
+            f.write(trace_bytes)
+        log.info("Wrote %d bytes to %s", len(trace_bytes), output_path)
+    else:
+        perfetto = timeline_to_perfetto(trace_data, group_by=args.group_by)
+        with open(output_path, "w") as f:
+            json.dump(perfetto, f, indent=2)
+        num_events = len(perfetto["traceEvents"])
+        log.info("Wrote %d events to %s", num_events, output_path)
 
-    num_events = len(perfetto["traceEvents"])
-    log.info("Wrote %d events to %s", num_events, output_path)
     log.info("Open https://ui.perfetto.dev and drag in the file to view.")
 
     if args.open:
