@@ -803,6 +803,7 @@ _COUNTER_CATEGORY_ORDER: list[tuple[int, list[str]]] = [
     # 0: GPU activity & cores
     (0, [
         "GT Active Core Count",
+        "Raytracing Active GT",
     ]),
     # 1: Occupancy
     (1, [
@@ -927,7 +928,6 @@ _COUNTER_CATEGORY_ORDER: list[tuple[int, list[str]]] = [
     # 8: Raytracing
     (8, [
         "Raytracing Active",
-        "Raytracing Active GT",
         "Ray Occupancy",
         "Leaf Test Occupancy",
         "Ray T Leaf Test",

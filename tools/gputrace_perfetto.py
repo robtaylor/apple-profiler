@@ -836,6 +836,7 @@ _COUNTER_SEQ = 3
 _COUNTER_GROUP_MAP: dict[str, str] = {
     # GPU activity & cores
     "GT Active Core Count": "GPU Activity",
+    "Raytracing Active GT": "GPU Activity",
     # Occupancy
     "Total Occupancy": "Occupancy",
     "Compute Occupancy": "Occupancy",
@@ -944,7 +945,6 @@ _COUNTER_GROUP_MAP: dict[str, str] = {
     "MMU Limiter": "L2 / Texture / MMU",
     # Raytracing
     "Raytracing Active": "Raytracing",
-    "Raytracing Active GT": "Raytracing",
     "Ray Occupancy": "Raytracing",
     "Leaf Test Occupancy": "Raytracing",
     "Ray T Leaf Test": "Raytracing",
