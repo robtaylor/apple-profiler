@@ -1116,7 +1116,6 @@ _HTML_TEMPLATE = """\
 <script src="https://unpkg.com/cytoscape@3/dist/cytoscape.min.js"></script>
 <script src="https://unpkg.com/dagre@0.8/dist/dagre.min.js"></script>
 <script src="https://unpkg.com/cytoscape-dagre@2/cytoscape-dagre.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/cytoscape-tidytree/dist/cytoscape-tidytree.min.js"></script>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
