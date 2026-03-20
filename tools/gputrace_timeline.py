@@ -797,6 +797,167 @@ def _extract_mio_counter(
     return timestamps, values
 
 
+# Counter display order: most useful categories first, then alphabetical
+# within each category. Tuple is (priority, name) for stable sorting.
+_COUNTER_CATEGORY_ORDER: list[tuple[int, list[str]]] = [
+    # 0: GPU activity & cores
+    (0, [
+        "GT Active Core Count",
+    ]),
+    # 1: Occupancy
+    (1, [
+        "Total Occupancy",
+        "Compute Occupancy",
+        "Fragment Occupancy",
+        "Vertex Occupancy",
+        "Occupancy Manager Target",
+        "Total Simdgroups Inflight Per Shader Core",
+        "Compute Simdgroups Inflight Per Shader Core",
+        "Fragment Simdgroups Inflight Per Shader Core",
+        "Vertex Simdgroups Inflight Per Shader Core",
+        "Occupancy Management L1 Eviction Rate",
+    ]),
+    # 2: Memory bandwidth
+    (2, [
+        "AF Bandwidth",
+        "AF Read Bandwidth",
+        "AF Write Bandwidth",
+        "AF Peak Bandwidth",
+        "AF Peak Read Bandwidth",
+        "AF Peak Write Bandwidth",
+        "L2 Bandwidth",
+    ]),
+    # 3: Shader core utilization & instruction throughput
+    (3, [
+        "Shader Core Utilization",
+        "Shader Core Limiter",
+        "ALU Utilization",
+        "F16 Utilization",
+        "F16 Limiter",
+        "F32 Utilization",
+        "F32 Limiter",
+        "IC Utilization",
+        "IC Limiter",
+        "SCIB Utilization",
+        "SCIB Limiter",
+        "Control Flow Utilization",
+        "Control Flow Limiter",
+        "Instruction Dispatch Utilization",
+        "Instruction Dispatch Limiter",
+        "Instruction Issue Utilization",
+        "Instruction Issue Limiter",
+        "Address Generation Utilization",
+        "Address Generation Limiter",
+    ]),
+    # 4: Shader launch
+    (4, [
+        "Compute Shader Launch Utilization",
+        "Compute Shader Launch Limiter",
+        "Fragment Shader Launch Utilization",
+        "Fragment Shader Launch Limiter",
+        "Vertex Shader Launch Utilization",
+        "Vertex Shader Launch Limiter",
+    ]),
+    # 5: L1 cache bandwidth
+    (5, [
+        "L1 Load Bandwidth",
+        "L1 Store Bandwidth",
+        "L1 Cache Utilization",
+        "L1 Cache Limiter",
+        "Buffer L1 Load Bandwidth",
+        "Buffer L1 Store Bandwidth",
+        "Buffer L1 Load Ratio",
+        "Buffer L1 Store Ratio",
+        "Buffer L1 Miss Rate",
+        "Imageblock L1 Load Bandwidth",
+        "Imageblock L1 Store Bandwidth",
+        "Imageblock L1 Load Ratio",
+        "Imageblock L1 Store Ratio",
+        "Threadgroup Memory L1 Load Bandwidth",
+        "Threadgroup Memory L1 Store Bandwidth",
+        "Threadgroup L1 Load Ratio",
+        "Threadgroup L1 Store Ratio",
+        "Stack L1 Load Bandwidth",
+        "Stack L1 Store Bandwidth",
+        "Stack L1 Load Ratio",
+        "Stack L1 Store Ratio",
+        "GPR L1 Load Bandwidth",
+        "GPR L1 Store Bandwidth",
+        "GPR L1 Read Ratio",
+        "GPR L1 Write Ratio",
+        "Other L1 Load Bandwidth",
+        "Other L1 Store Bandwidth",
+        "Other L1 Loads Ratio",
+        "Other L1 Stores Ratio",
+    ]),
+    # 6: L1 residency / bytes occupancy
+    (6, [
+        "L1 Total Occupancy",
+        "L1 Total Bytes Occupancy",
+        "L1 Buffer Occupancy",
+        "L1 Buffer Bytes Occupancy",
+        "L1 Imageblock Occupancy",
+        "L1 Imageblock Bytes Occupancy",
+        "L1 Threadgroup Occupancy",
+        "L1 Threadgroup Bytes Occupancy",
+        "L1 GPR Occupancy",
+        "L1 GPR Bytes Occupancy",
+        "L1 Stack Occupancy",
+        "L1 Stack Bytes Occupancy",
+        "L1 Other Occupancy",
+        "L1 Other Bytes Occupancy",
+        "L1 Raytracing Scratch Occupancy",
+        "L1 Raytracing Scratch Bytes Occupancy",
+    ]),
+    # 7: L2 / texture / MMU
+    (7, [
+        "L2 Cache Utilization",
+        "L2 Cache Limiter",
+        "Texture Cache Utilization",
+        "Texture Cache Limiter",
+        "Texture Read Utilization",
+        "Texture Read Limiter",
+        "Texture Write Utilization",
+        "Texture Write Limiter",
+        "TextureFilteringLimiter",
+        "CompressionRatioTextureMemoryRead",
+        "MMU Utilization",
+        "MMU Limiter",
+    ]),
+    # 8: Raytracing
+    (8, [
+        "Raytracing Active",
+        "Raytracing Active GT",
+        "Ray Occupancy",
+        "Leaf Test Occupancy",
+        "Ray T Leaf Test",
+        "Raytracing Node Test",
+        "Intersect Ray Threads",
+        "Raytracing Scratch L1 Load Bandwidth",
+        "Raytracing Scratch L1 Store Bandwidth",
+        "Raytracing Scratch L1 Load Ratio",
+        "Raytracing Scratch L1 Store Ratio",
+    ]),
+]
+
+# Build lookup: counter name → (category_priority, index_within_category)
+_COUNTER_SORT_MAP: dict[str, tuple[int, int]] = {}
+for _cat_prio, _names in _COUNTER_CATEGORY_ORDER:
+    for _idx, _name in enumerate(_names):
+        _COUNTER_SORT_MAP[_name] = (_cat_prio, _idx)
+
+# Unlisted named counters go after all listed ones, sorted alphabetically
+_UNLISTED_CATEGORY = len(_COUNTER_CATEGORY_ORDER)
+
+
+def _counter_sort_key(name: str) -> tuple[int, int, str]:
+    """Return sort key placing counters in category priority order."""
+    if name in _COUNTER_SORT_MAP:
+        cat, idx = _COUNTER_SORT_MAP[name]
+        return (cat, idx, name)
+    return (_UNLISTED_CATEGORY, 0, name)
+
+
 def read_gputrace_counters(
     gputrace_path: str,
     *,
@@ -964,12 +1125,15 @@ def read_gputrace_counters(
         return None
 
     # Enumerate all available counters from the dict.
-    # Counters may have different sample counts (e.g. per-core vs system-wide),
-    # so we group by sample count and use the largest group.
+    # Filter out SHA256 hash-named counters (internal vendor IDs) and
+    # all-zero counters. Group by sample count for resampling.
     all_keys = counters_dict.allKeys()
     by_sample_count: dict[int, list[tuple[str, Any]]] = {}
     for i in range(all_keys.count()):
         name = str(all_keys.objectAtIndex_(i))
+        # Skip SHA256 hash-named counters (64-char hex strings)
+        if len(name) == 64 and all(c in "0123456789ABCDEFabcdef" for c in name):
+            continue
         c_obj = counters_dict.objectForKey_(name)
         sc = c_obj.sampleCount()
         if sc <= 0:
@@ -985,44 +1149,45 @@ def read_gputrace_counters(
 
     # Use the group with the most counters as the primary set
     primary_sc = max(by_sample_count, key=lambda sc: len(by_sample_count[sc]))
-    primary_counters = sorted(by_sample_count[primary_sc], key=lambda x: x[0])
     num_samples = primary_sc
 
-    # Also include counters with different sample counts by resampling
-    # to the primary sample count via nearest-neighbor on timestamps
-    other_counters: list[tuple[str, Any]] = []
-    for sc, items in sorted(by_sample_count.items()):
-        if sc != primary_sc:
-            other_counters.extend(items)
-    other_counters.sort(key=lambda x: x[0])
+    # Merge all counters into a single list, tagging those needing resample
+    all_counters: list[tuple[str, Any, bool]] = []  # (name, obj, needs_resample)
+    for sc, items in by_sample_count.items():
+        for name, obj in items:
+            all_counters.append((name, obj, sc != primary_sc))
 
-    counter_names: list[str] = [name for name, _ in primary_counters]
-    counter_objects: list[Any] = [obj for _, obj in primary_counters]
+    # Sort counters by category priority for useful Perfetto track ordering
+    all_counters.sort(key=lambda x: _counter_sort_key(x[0]))
 
-    # Extract timestamps from the first counter (shared across all in group)
-    timestamps, _ = _extract_mio_counter(counter_objects[0], num_samples)
+    # Extract timestamps from first primary-rate counter
+    first_primary = next(
+        obj for _, obj, resample in all_counters if not resample
+    )
+    timestamps, _ = _extract_mio_counter(first_primary, num_samples)
 
-    # Extract values for each primary counter
+    # Build counter_names and samples in priority order
+    counter_names: list[str] = []
     samples: list[list[float]] = [[] for _ in range(num_samples)]
-    for ci, c_obj in enumerate(counter_objects):
-        _, values = _extract_mio_counter(c_obj, num_samples)
+    n_resampled = 0
+
+    for name, c_obj, needs_resample in all_counters:
+        counter_names.append(name)
+        if needs_resample:
+            other_sc = c_obj.sampleCount()
+            other_ts, other_vals = _extract_mio_counter(c_obj, other_sc)
+            values = _resample_nearest(other_ts, other_vals, timestamps)
+            n_resampled += 1
+        else:
+            _, values = _extract_mio_counter(c_obj, num_samples)
         for s in range(num_samples):
             samples[s].append(values[s])
-
-    # Resample other-rate counters to primary timestamps via nearest-neighbor
-    for name, c_obj in other_counters:
-        other_sc = c_obj.sampleCount()
-        other_ts, other_vals = _extract_mio_counter(c_obj, other_sc)
-        resampled = _resample_nearest(other_ts, other_vals, timestamps)
-        counter_names.append(name)
-        for s in range(num_samples):
-            samples[s].append(resampled[s])
 
     log.info(
         "Extracted %d counters x %d samples from MIO timeline "
         "(%d primary-rate, %d resampled)",
         len(counter_names), num_samples,
-        len(primary_counters), len(other_counters),
+        len(counter_names) - n_resampled, n_resampled,
     )
 
     return {
