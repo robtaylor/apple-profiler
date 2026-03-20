@@ -27,13 +27,17 @@ from __future__ import annotations
 
 import ctypes
 import glob as globmod
+import json
 import logging
 import os
 import re
 import struct
+import subprocess
 import sys
+import time
 import warnings
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 import objc  # type: ignore[import-untyped]
@@ -581,148 +585,134 @@ def _find_stream_data(gputrace_path: str) -> str | None:
     return None
 
 
-def _replay_gputrace(gputrace_path: str, timeout: int = 120) -> str | None:
-    """Open gputrace in Xcode and click Replay to trigger shader profiling.
+_JXA_SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "xcode_gputrace_automation.js")
 
-    Uses JXA (JavaScript for Automation) via osascript to:
-      1. Open the gputrace in Xcode
-      2. Wait for it to load
-      3. Find and click the "Replay" button
-      4. Poll for streamData to appear
+
+def _run_jxa(action: str, *args: str) -> dict[str, Any] | str | None:
+    """Run the JXA automation script with an action and args, parse JSON result."""
+    cmd = ["osascript", "-l", "JavaScript", _JXA_SCRIPT_PATH, action, *args]
+    try:
+        out = subprocess.check_output(
+            cmd, stderr=subprocess.STDOUT, timeout=15,
+        )
+        text = out.decode().strip()
+        if text.startswith("{"):
+            return json.loads(text)
+        return text
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        out_text = ""
+        if hasattr(e, "output") and e.output:
+            out_text = e.output.decode()
+        log.warning("JXA %s failed: %s %s", action, e, out_text)
+        return None
+
+
+def _snapshot_stream_data() -> dict[str, float]:
+    """Snapshot current streamData files and their mtimes in the profiling dir."""
+    profiling_dir = Path(_XCODE_PROFILING_DIR)
+    mtimes: dict[str, float] = {}
+    if profiling_dir.exists():
+        for d in profiling_dir.glob("*.gpuprofiler_raw"):
+            sd = d / "streamData"
+            if sd.exists():
+                mtimes[str(sd)] = sd.stat().st_mtime
+    return mtimes
+
+
+def _check_new_stream_data(before: dict[str, float]) -> str | None:
+    """Check for new or updated streamData file since the snapshot."""
+    profiling_dir = Path(_XCODE_PROFILING_DIR)
+    if not profiling_dir.exists():
+        return None
+    for d in profiling_dir.glob("*.gpuprofiler_raw"):
+        sd = d / "streamData"
+        if not sd.exists() or sd.stat().st_size == 0:
+            continue
+        sd_str = str(sd)
+        cur_mtime = sd.stat().st_mtime
+        is_new = sd_str not in before
+        is_updated = sd_str in before and cur_mtime > before[sd_str]
+        if is_new or is_updated:
+            return sd_str
+    return None
+
+
+def _replay_gputrace(gputrace_path: str, timeout: int = 120) -> str | None:
+    """Open gputrace in Xcode, click Replay, wait for profiling to complete.
+
+    Full lifecycle: close existing window → open fresh → enable profiling →
+    click Replay → monitor Activity View + filesystem → close window.
 
     Returns path to streamData if successful, None otherwise.
     """
-    import subprocess
-    from pathlib import Path
-
     abs_path = os.path.abspath(gputrace_path)
-    log.info("Opening %s in Xcode for replay...", abs_path)
+    stem = os.path.splitext(os.path.basename(gputrace_path))[0]
 
-    # Open the gputrace in Xcode
+    # 1. Close existing gputrace window if open
+    close_result = _run_jxa("close-window", stem)
+    if isinstance(close_result, dict) and close_result.get("closed"):
+        log.info("Closed existing gputrace window for %s", stem)
+        time.sleep(0.5)
+
+    # 2. Open gputrace in Xcode
+    log.info("Opening %s in Xcode for replay...", abs_path)
     try:
         subprocess.run(["open", "-a", "Xcode", abs_path], check=True, timeout=10)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         log.warning("Failed to open gputrace in Xcode: %s", e)
         return None
 
-    import time
-    time.sleep(3)  # Wait for Xcode to load the capture
+    # 3. Wait for window to appear and click Replay (poll up to 15s)
+    replayed = False
+    for attempt in range(30):
+        time.sleep(0.5)
+        result = _run_jxa("ensure-replay", stem)
+        if isinstance(result, dict) and result.get("replayed"):
+            profiled = result.get("profiled", False)
+            log.info(
+                "Replay started (profiling %s)",
+                "enabled" if profiled else "NOT confirmed",
+            )
+            replayed = True
+            break
+        # Log the specific error for debugging
+        if isinstance(result, dict) and result.get("error") and attempt == 29:
+            log.warning("ensure-replay error: %s", result["error"])
 
-    # Ensure "Profile after replay" is checked, then click Replay via JXA
-    jxa_script = '''
-var se = Application("System Events");
-var xcode = se.processes["Xcode"];
-Application("Xcode").activate();
-delay(0.5);
-
-function findElement(element, role, name, depth) {
-    if (depth > 15) return null;
-    try {
-        var items;
-        if (role === "AXButton") items = element.buttons.whose({name: name})();
-        else if (role === "AXCheckBox") items = element.checkboxes.whose({name: name})();
-        if (items && items.length > 0) return items[0];
-    } catch(e) {}
-    try {
-        var sgs = element.splitterGroups();
-        for (var i = 0; i < sgs.length; i++) {
-            var found = findElement(sgs[i], role, name, depth + 1);
-            if (found) return found;
-        }
-    } catch(e) {}
-    try {
-        var gs = element.groups();
-        for (var i = 0; i < gs.length; i++) {
-            var found = findElement(gs[i], role, name, depth + 1);
-            if (found) return found;
-        }
-    } catch(e) {}
-    return null;
-}
-
-var win = xcode.windows[0];
-var msg = "";
-
-var cb = findElement(win, "AXCheckBox", "Profile after replay", 0);
-if (cb) {
-    if (cb.value() != 1) {
-        cb.click();
-        msg += "Enabled profiling. ";
-    } else {
-        msg += "Profiling already enabled. ";
-    }
-} else {
-    msg += "WARN: Profile checkbox not found. ";
-}
-
-var btn = findElement(win, "AXButton", "Replay", 0);
-if (btn) {
-    btn.click();
-    msg += "Clicked Replay.";
-} else {
-    msg = "ERROR: Could not find Replay button";
-}
-msg;
-'''
-
-    try:
-        result = subprocess.check_output(
-            ["osascript", "-l", "JavaScript", "-e", jxa_script],
-            stderr=subprocess.STDOUT, timeout=30,
-        ).decode().strip()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        out = e.output.decode() if hasattr(e, "output") and e.output else str(e)
-        log.warning("Failed to click Replay: %s", out)
+    if not replayed:
+        log.warning("Failed to find and click Replay within 15s")
         return None
 
-    if "ERROR" in result:
-        log.warning("Replay button not found: %s", result)
-        return None
+    # 4. Snapshot existing streamData files
+    before = _snapshot_stream_data()
 
-    log.info("%s — waiting for profiling to complete...", result)
-
-    # Snapshot existing streamData files and their mtimes
-    profiling_dir = Path(_XCODE_PROFILING_DIR)
-    before_dirs = set()
-    before_mtimes: dict[str, float] = {}
-    if profiling_dir.exists():
-        for d in profiling_dir.glob("*.gpuprofiler_raw"):
-            before_dirs.add(d)
-            sd = d / "streamData"
-            if sd.exists():
-                before_mtimes[str(sd)] = sd.stat().st_mtime
-
+    # 5. Poll for completion: filesystem check + Activity View logging
     for i in range(timeout):
         time.sleep(1)
-        if not profiling_dir.exists():
-            continue
 
-        for d in profiling_dir.glob("*.gpuprofiler_raw"):
-            sd = d / "streamData"
-            if not sd.exists() or sd.stat().st_size == 0:
-                continue
-
-            sd_str = str(sd)
-            cur_mtime = sd.stat().st_mtime
-
-            # New dir, or existing streamData with updated mtime
-            is_new = d not in before_dirs
-            is_updated = (
-                sd_str in before_mtimes
-                and cur_mtime > before_mtimes[sd_str]
+        # Check filesystem for new/updated streamData
+        new_sd = _check_new_stream_data(before)
+        if new_sd:
+            sd_path = Path(new_sd)
+            log.info(
+                "Profiling complete after %ds: %s (%d bytes)",
+                i + 1, new_sd, sd_path.stat().st_size,
             )
+            # 6. Close gputrace window
+            _run_jxa("close-window", stem)
+            return new_sd
 
-            if is_new or is_updated:
-                log.info(
-                    "Profiling complete after %ds: %s (%d bytes)",
-                    i + 1, sd, sd.stat().st_size,
-                )
-                return sd_str
-
-        if i % 15 == 14:
-            log.info("  ... still waiting (%ds)", i + 1)
+        # Log progress from Activity View periodically
+        if i % 10 == 9:
+            status = _run_jxa("poll-activity")
+            status_text = "unknown"
+            if isinstance(status, dict):
+                status_text = status.get("status", "unknown")
+            log.info("  ... %ds — Xcode: %s", i + 1, status_text)
 
     log.warning("Profiling did not complete within %ds", timeout)
+    # Clean up: close the window even on timeout
+    _run_jxa("close-window", stem)
     return None
 
 
