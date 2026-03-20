@@ -726,6 +726,80 @@ msg;
     return None
 
 
+# Known MIO timeline counter names (discovered via framework binary strings).
+# These are the human-readable names accepted by GTMioTimelineCounters.counterForName:.
+_MIO_COUNTER_NAMES: list[str] = [
+    "AF Bandwidth",
+    "AF Peak Bandwidth",
+    "AF Peak Read Bandwidth",
+    "AF Peak Write Bandwidth",
+    "AF Read Bandwidth",
+    "AF Write Bandwidth",
+    "CompressionRatioTextureMemoryRead",
+    "L2 Bandwidth",
+    "L2 Cache Limiter",
+    "L2 Cache Utilization",
+    "MMU Limiter",
+    "MMU Utilization",
+    "Texture Cache Limiter",
+    "Texture Cache Utilization",
+    "Texture Read Limiter",
+    "Texture Read Utilization",
+    "Texture Write Limiter",
+    "Texture Write Utilization",
+    "TextureFilteringLimiter",
+]
+
+# LLVM helper path required by GTShaderProfilerStreamDataProcessor
+_LLVM_HELPER_PATH = (
+    "/Applications/Xcode.app/Contents/Developer/Platforms/"
+    "MacOSX.platform/Developer/Library/GPUToolsPlatform/PlugIns/GTLLVMHelper"
+)
+
+
+def _extract_mio_counter(
+    counter: Any,
+    sample_count: int,
+) -> tuple[list[int], list[float]]:
+    """Extract timestamps and values from a GTMioCounterData object.
+
+    The timestamps() and values() methods return raw C pointers (uint64*
+    and double*) that pyobjc cannot bridge. We use ctypes objc_msgSend
+    to get the pointers and memmove to copy the data.
+    """
+    libobjc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.dylib")
+    sel_registerName = libobjc.sel_registerName
+    sel_registerName.restype = ctypes.c_void_p
+    sel_registerName.argtypes = [ctypes.c_char_p]
+
+    # Pointer-returning objc_msgSend
+    objc_msgSend_ptr = ctypes.CFUNCTYPE(
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    )(("objc_msgSend", libobjc))
+
+    counter_ptr = objc.pyobjc_id(counter)
+
+    # Timestamps: uint64 array
+    sel_ts = sel_registerName(b"timestamps")
+    ts_raw = objc_msgSend_ptr(counter_ptr, sel_ts)
+    assert ts_raw, "timestamps() returned NULL"
+
+    ts_buf = (ctypes.c_uint64 * sample_count)()
+    ctypes.memmove(ts_buf, ts_raw, sample_count * 8)
+    timestamps = [int(ts_buf[i]) for i in range(sample_count)]
+
+    # Values: double array
+    sel_vals = sel_registerName(b"values")
+    vals_raw = objc_msgSend_ptr(counter_ptr, sel_vals)
+    assert vals_raw, "values() returned NULL"
+
+    vals_buf = (ctypes.c_double * sample_count)()
+    ctypes.memmove(vals_buf, vals_raw, sample_count * 8)
+    values = [float(vals_buf[i]) for i in range(sample_count)]
+
+    return timestamps, values
+
+
 def read_gputrace_counters(
     gputrace_path: str,
     *,
@@ -733,6 +807,9 @@ def read_gputrace_counters(
     replay_timeout: int = 120,
 ) -> dict[str, Any] | None:
     """Extract derived GPU performance counter samples from streamData.
+
+    Uses GTShaderProfilerStreamDataProcessor → mioData() → overlapping
+    timeline → counterForName: to extract per-counter time-series data.
 
     Searches for streamData in the gputrace bundle and Xcode's temp
     profiling directory. If not found and replay=True, opens the
@@ -744,8 +821,8 @@ def read_gputrace_counters(
     Returns a dict with keys:
       counter_names  - list of counter name strings
       num_samples    - number of periodic samples
-      timestamps_ns  - list of uint64 timestamps in nanoseconds
-      samples        - list of lists: samples[i][j] = float value for
+      timestamps_ns  - list of uint64 timestamps (MIO timeline ticks)
+      samples        - list of lists: samples[i][j] = float64 value for
                        sample i, counter j
     """
     stream_path = _find_stream_data(gputrace_path)
@@ -773,8 +850,12 @@ def read_gputrace_counters(
 
     try:
         GTShaderProfilerStreamData = objc.lookUpClass("GTShaderProfilerStreamData")
-        GTMutableShaderProfilerStreamData = objc.lookUpClass("GTMutableShaderProfilerStreamData")
-        GTAGX2StreamDataTimelineProcessor = objc.lookUpClass("GTAGX2StreamDataTimelineProcessor")
+        GTMutableShaderProfilerStreamData = objc.lookUpClass(
+            "GTMutableShaderProfilerStreamData",
+        )
+        GTShaderProfilerStreamDataProcessor = objc.lookUpClass(
+            "GTShaderProfilerStreamDataProcessor",
+        )
     except objc.nosuchclass_error as e:
         log.warning("Required ObjC class not found: %s", e)
         return None
@@ -799,97 +880,102 @@ def read_gputrace_counters(
     ])
 
     result = NSKeyedUnarchiver.unarchivedObjectOfClasses_fromData_error_(
-        allowlist, data, None
+        allowlist, data, None,
     )
     sd = result[0] if isinstance(result, tuple) else result
     if sd is None:
         log.warning("Failed to unarchive streamData")
         return None
 
-    # Process through timeline processor
-    processor = GTAGX2StreamDataTimelineProcessor.alloc().initWithStreamData_(sd)
-    processor.processStreamData()
-    tl_info = processor.timelineInfo()
-    agg = tl_info.aggregatedGPUTimelineInfo()
-    if agg is None:
-        log.warning("No aggregated GPU timeline info available")
+    # Process via GTShaderProfilerStreamDataProcessor → MIO data path
+    if not os.path.exists(_LLVM_HELPER_PATH):
+        log.warning("LLVM helper not found at %s", _LLVM_HELPER_PATH)
         return None
 
-    # Extract counter names
-    names_ns = agg.derivedCounterNames()
-    if names_ns is None or names_ns.count() == 0:
+    log.info("Processing streamData via MIO pipeline (this may take a moment)...")
+    processor = GTShaderProfilerStreamDataProcessor.alloc() \
+        .initWithStreamData_llvmHelperPath_(sd, _LLVM_HELPER_PATH)
+    processor.processStreamData()
+    processor.waitUntilFinished()
+
+    mio = processor.mioData()
+    if mio is None:
+        log.warning("MIO data is None — processing may have failed")
+        return None
+
+    mio.loadTimeline()
+    timeline = mio.overlappingTimeline()
+    if timeline is None:
+        log.warning("No overlapping timeline in MIO data")
+        return None
+
+    if timeline.profiledState() != 2:
         if replay:
             log.info(
-                "Existing streamData has no counter data "
-                "(profiledState=%s) — triggering Xcode replay...",
-                tl_info.profiledState(),
+                "streamData has profiledState=%d (not profiled) "
+                "— triggering Xcode replay...",
+                timeline.profiledState(),
             )
             new_path = _replay_gputrace(gputrace_path, timeout=replay_timeout)
             if new_path is not None:
-                # Retry once with replay=False to avoid infinite recursion
                 return read_gputrace_counters(
                     gputrace_path, replay=False,
                     replay_timeout=replay_timeout,
                 )
-        log.info("No derived counter names found in streamData")
+        log.info(
+            "profiledState=%d — no counter data. "
+            "Replay with shader profiling enabled.",
+            timeline.profiledState(),
+        )
         return None
 
+    tc = timeline.timelineCounters()
+    if tc is None:
+        log.warning("No timeline counters available")
+        return None
+
+    # Discover available counters by probing known names
     counter_names: list[str] = []
-    for i in range(names_ns.count()):
-        counter_names.append(str(names_ns.objectAtIndex_(i)))
+    counter_objects: list[Any] = []
+    for name in _MIO_COUNTER_NAMES:
+        try:
+            c = tc.counterForName_(name)
+            if c is not None and c.sampleCount() > 0:
+                counter_names.append(name)
+                counter_objects.append(c)
+        except Exception:
+            pass
 
-    # Extract sample count
-    num_samples = int(agg.numPeriodicSamples())
-    if num_samples == 0:
-        log.info("No periodic samples found")
+    if not counter_names:
+        log.info("No counters found with known names")
         return None
 
-    num_counters = len(counter_names)
+    # All counters should have the same sample count
+    num_samples = counter_objects[0].sampleCount()
 
-    # Extract derived counter values (float32 array)
-    dc = agg.derivedCounters()
-    if dc is None or dc.length() == 0:
-        log.warning("No derived counter data")
-        return None
+    # Extract timestamps from the first counter (shared across all)
+    timestamps, _ = _extract_mio_counter(counter_objects[0], num_samples)
 
-    expected_bytes = num_samples * num_counters * 4
-    assert dc.length() == expected_bytes, (
-        f"derivedCounters size mismatch: {dc.length()} != {expected_bytes}"
-    )
-
-    raw_floats = dc.bytes()
-    samples: list[list[float]] = []
-    for s in range(num_samples):
-        row: list[float] = []
-        for c in range(num_counters):
-            offset = (s * num_counters + c) * 4
-            val = struct.unpack_from("<f", raw_floats, offset)[0]
-            row.append(float(val))
-        samples.append(row)
-
-    # Extract timestamps (uint64 array)
-    ts = agg.timestamps()
-    timestamps_ns: list[int] = []
-    if ts is not None and ts.length() > 0:
-        ts_data = ts.bytes()
-        num_ts = ts.length() // 8
-        for i in range(num_ts):
-            t = struct.unpack_from("<Q", ts_data, i * 8)[0]
-            timestamps_ns.append(t)
-
-    assert len(timestamps_ns) == num_samples, (
-        f"timestamp count mismatch: {len(timestamps_ns)} != {num_samples}"
-    )
+    # Extract values for each counter
+    samples: list[list[float]] = [[] for _ in range(num_samples)]
+    for ci, c_obj in enumerate(counter_objects):
+        assert c_obj.sampleCount() == num_samples, (
+            f"Counter {counter_names[ci]} has {c_obj.sampleCount()} samples, "
+            f"expected {num_samples}"
+        )
+        _, values = _extract_mio_counter(c_obj, num_samples)
+        for s in range(num_samples):
+            samples[s].append(values[s])
 
     log.info(
-        "Extracted %d counters x %d samples",
-        num_counters, num_samples,
+        "Extracted %d counters x %d samples from MIO timeline",
+        len(counter_names), num_samples,
     )
 
     return {
         "counter_names": counter_names,
         "num_samples": num_samples,
-        "timestamps_ns": timestamps_ns,
+        "timestamps_ns": timestamps,
         "samples": samples,
     }
 

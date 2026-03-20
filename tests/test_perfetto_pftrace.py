@@ -667,11 +667,13 @@ def _counter_sample_pkts(trace: pb.Trace) -> list:
 
 
 _COUNTER_DATA = {
-    "counter_names": ["ALUUtilization", "GPUCycles", "L2CacheUtilization", "FSVertexCount"],
+    "counter_names": [
+        "L2 Cache Utilization", "AF Bandwidth", "L2 Cache Limiter", "AF Peak Bandwidth",
+    ],
     "num_samples": 3,
     "timestamps_ns": [1000000, 2000000, 3000000],
     "samples": [
-        [0.85, 1234567.0, 0.42, 0.0],  # FSVertexCount always 0 → filtered
+        [0.85, 1234567.0, 0.42, 0.0],  # AF Peak Bandwidth always 0 → filtered
         [0.91, 1234890.0, 0.38, 0.0],
         [0.78, 1235200.0, 0.45, 0.0],
     ],
@@ -703,21 +705,21 @@ class TestPftraceCounterTracks:
         desc_pkts = _counter_descriptor_pkts(trace)
         specs = list(desc_pkts[0].gpu_counter_event.counter_descriptor.specs)
         names = {s.name for s in specs}
-        assert names == {"ALUUtilization", "GPUCycles", "L2CacheUtilization"}
+        assert names == {"L2 Cache Utilization", "AF Bandwidth", "L2 Cache Limiter"}
 
     def test_counter_spec_groups(self):
-        """ALUUtilization→COMPUTE(6), GPUCycles→SYSTEM(1), L2Cache→MEMORY(5)."""
+        """L2 Cache Utilization→MEMORY(5), AF Bandwidth→MEMORY(5), L2 Cache Limiter→MEMORY(5)."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
         trace = _parse_trace(raw)
         desc_pkts = _counter_descriptor_pkts(trace)
         desc = desc_pkts[0].gpu_counter_event.counter_descriptor
         specs = {s.name: list(s.groups) for s in desc.specs}
-        assert specs["ALUUtilization"] == [6]   # COMPUTE
-        assert specs["GPUCycles"] == [1]         # SYSTEM
-        assert specs["L2CacheUtilization"] == [5]  # MEMORY
+        assert specs["L2 Cache Utilization"] == [5]  # MEMORY
+        assert specs["AF Bandwidth"] == [5]          # MEMORY
+        assert specs["L2 Cache Limiter"] == [5]      # MEMORY
 
     def test_counter_spec_units(self):
-        """ALUUtilization→PERCENT(37), GPUCycles→NONE(0), L2Cache→PERCENT(37)."""
+        """L2 Cache Utilization→PERCENT(37), AF Bandwidth→BYTE(7), L2 Cache Limiter→PERCENT(37)."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
         trace = _parse_trace(raw)
         desc_pkts = _counter_descriptor_pkts(trace)
@@ -725,9 +727,9 @@ class TestPftraceCounterTracks:
             s.name: list(s.numerator_units)
             for s in desc_pkts[0].gpu_counter_event.counter_descriptor.specs
         }
-        assert specs["ALUUtilization"] == [37]      # PERCENT
-        assert specs["GPUCycles"] == [0]             # NONE
-        assert specs["L2CacheUtilization"] == [37]   # PERCENT
+        assert specs["L2 Cache Utilization"] == [37]  # PERCENT
+        assert specs["AF Bandwidth"] == [7]           # BYTE
+        assert specs["L2 Cache Limiter"] == [37]      # PERCENT
 
     def test_counter_sample_packets(self):
         """3 sample packets, each with 3 GpuCounter entries."""
@@ -758,20 +760,20 @@ class TestPftraceCounterTracks:
             c.counter_id: c.double_value
             for c in first[0].gpu_counter_event.counters
         }
-        # counter_id 0=ALUUtilization, 1=GPUCycles, 2=L2CacheUtilization
+        # counter_id 0=L2 Cache Utilization, 1=AF Bandwidth, 2=L2 Cache Limiter
         assert abs(values[0] - 0.85) < 1e-5
         assert abs(values[1] - 1234567.0) < 1e-1
         assert abs(values[2] - 0.42) < 1e-5
 
     def test_counter_zero_filtering(self):
-        """All-zero counter (FSVertexCount) absent from both descriptor and samples."""
+        """All-zero counter (AF Peak Bandwidth) absent from both descriptor and samples."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
         trace = _parse_trace(raw)
         # Check descriptor
         desc_pkts = _counter_descriptor_pkts(trace)
         spec_names = {s.name for s in desc_pkts[0].gpu_counter_event.counter_descriptor.specs}
-        assert "FSVertexCount" not in spec_names
-        # Check samples: counter_id 3 (FSVertexCount) should not appear
+        assert "AF Peak Bandwidth" not in spec_names
+        # Check samples: counter_id 3 (AF Peak Bandwidth) should not appear
         sample_pkts = _counter_sample_pkts(trace)
         for pkt in sample_pkts:
             counter_ids = {c.counter_id for c in pkt.gpu_counter_event.counters}

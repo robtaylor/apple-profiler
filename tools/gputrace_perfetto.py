@@ -833,56 +833,33 @@ _COUNTER_SEQ = 3
 # Counter name → GpuCounterGroup enum value mapping
 # Values: UNCLASSIFIED=0, SYSTEM=1, VERTICES=2, FRAGMENTS=3,
 #         PRIMITIVES=4, MEMORY=5, COMPUTE=6, RAY_TRACING=7
+#
+# These names come from the MIO timeline (GTMioTimelineCounters.counterForName:).
 _COUNTER_GROUPS: dict[str, int] = {
-    "ALUUtilization": 6,       # COMPUTE
-    "GPUCycles": 1,            # SYSTEM
-    "GPUReadBandwidth": 5,     # MEMORY
-    "GPUWriteBandwidth": 5,    # MEMORY
-    "L2CacheUtilization": 5,   # MEMORY
-    "L2CacheLimiter": 5,       # MEMORY
-    "L2CacheMissRate": 5,      # MEMORY
-    "MainMemoryReadBytes": 5,  # MEMORY
-    "MainMemoryWriteBytes": 5, # MEMORY
-    "MainMemoryThroughput": 5, # MEMORY
-    "MainMemoryTraffic": 5,    # MEMORY
-    "BytesWrittenToMainMemory": 5,  # MEMORY
-    "MMULimiter": 5,           # MEMORY
-    "MMUUtilization": 5,       # MEMORY
-    "TextureFilteringLimiter": 3,  # FRAGMENTS
-    "TextureSamples": 3,       # FRAGMENTS
-    "TextureAccesses": 3,      # FRAGMENTS
-    "SampleLimiter": 3,        # FRAGMENTS
-    "TPULimiter": 3,           # FRAGMENTS
-    "FragmentSampleLimiter": 3,  # FRAGMENTS
-    "FragmentTPULimiter": 3,   # FRAGMENTS
-    # Vertex-stage counters
-    "VSArithmeticIntensity": 2,  # VERTICES
-    "VSBytesReadFromMainMemory": 2,  # VERTICES
-    "VSBytesWrittenToMainMemory": 2,  # VERTICES
-    "VSMainMemoryThroughput": 2,  # VERTICES
-    "VSTextureSamples": 2,     # VERTICES
-    "VSTextureSamplesPerInvocation": 2,  # VERTICES
-    "VSVertexCount": 2,        # VERTICES
-    "VertexSampleLimiter": 2,  # VERTICES
-    "VertexTPULimiter": 2,     # VERTICES
-    # Fragment-stage counters
-    "FSArithmeticIntensity": 3,  # FRAGMENTS
-    "FSBytesReadFromMainMemory": 3,  # FRAGMENTS
-    "FSBytesWrittenToMainMemory": 3,  # FRAGMENTS
-    "FSMainMemoryThroughput": 3,  # FRAGMENTS
-    "FSTextureSamples": 3,     # FRAGMENTS
-    "FSTextureSamplesPerInvocation": 3,  # FRAGMENTS
-    "FSVertexCount": 3,        # FRAGMENTS
-    # Compute-stage counters
-    "CSArithmeticIntensity": 6,  # COMPUTE
-    "CSTextureSamples": 6,     # COMPUTE
-    "CSTextureSamplesPerInvocation": 6,  # COMPUTE
-    # Compression
-    "CompressionRatioTextureMemoryRead": 5,  # MEMORY
-    "UnCompressedSamplesPercent": 3,  # FRAGMENTS
-    "PredicatedTextureReadPercentage": 3,  # FRAGMENTS
-    "MissBufferFullStallRatio": 5,  # MEMORY
-    "MMUTLBRequests": 5,       # MEMORY
+    # AF = Apple Fabric (system memory interconnect) — MEMORY
+    "AF Bandwidth": 5,
+    "AF Peak Bandwidth": 5,
+    "AF Peak Read Bandwidth": 5,
+    "AF Peak Write Bandwidth": 5,
+    "AF Read Bandwidth": 5,
+    "AF Write Bandwidth": 5,
+    # L2 cache — MEMORY
+    "L2 Bandwidth": 5,
+    "L2 Cache Limiter": 5,
+    "L2 Cache Utilization": 5,
+    # MMU (Memory Management Unit) — MEMORY
+    "MMU Limiter": 5,
+    "MMU Utilization": 5,
+    # Texture — FRAGMENTS
+    "Texture Cache Limiter": 3,
+    "Texture Cache Utilization": 3,
+    "Texture Read Limiter": 3,
+    "Texture Read Utilization": 3,
+    "Texture Write Limiter": 3,
+    "Texture Write Utilization": 3,
+    "TextureFilteringLimiter": 3,
+    # Compression — MEMORY
+    "CompressionRatioTextureMemoryRead": 5,
 }
 
 
@@ -987,14 +964,20 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Import gputrace_timeline (needs Apple frameworks + DYLD_FRAMEWORK_PATH)
+    import os
+
+    # gputrace_timeline loads Apple GPU frameworks at import time, which
+    # requires DYLD_FRAMEWORK_PATH to be set. Re-exec if missing.
+    _shared_fw = "/Applications/Xcode.app/Contents/SharedFrameworks"
+    if os.environ.get("DYLD_FRAMEWORK_PATH") != _shared_fw:
+        os.environ["DYLD_FRAMEWORK_PATH"] = _shared_fw
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
     tools_dir = str(Path(__file__).parent)
     if tools_dir not in sys.path:
         sys.path.insert(0, tools_dir)
 
-    from gputrace_timeline import _ensure_dyld_framework_path, read_gputrace
-
-    _ensure_dyld_framework_path()
+    from gputrace_timeline import read_gputrace
 
     trace_data = read_gputrace(args.gputrace)
     if trace_data is None:
