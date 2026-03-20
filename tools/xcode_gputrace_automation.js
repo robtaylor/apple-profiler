@@ -56,21 +56,6 @@ function jsonResult(obj) {
 }
 
 /**
- * Send Xcode to the back so it doesn't steal focus from the terminal.
- * Uses System Events to set Xcode's frontmost to false.
- */
-function sendXcodeToBack() {
-    try {
-        xcode.frontmost = false;
-        // Also tell the frontmost app to activate (usually Terminal/iTerm)
-        var frontApps = se.processes.whose({frontmost: true})();
-        if (frontApps.length > 0) {
-            Application(frontApps[0].name()).activate();
-        }
-    } catch (e) { /* best effort */ }
-}
-
-/**
  * Find the gputrace window whose title contains `stem`.
  *
  * After replay, Xcode changes the window title to "" (empty string) when
@@ -215,21 +200,17 @@ function findElementRecursive(element, role, name, depth) {
  * Uses allowEmpty=true since after replay the window title becomes "".
  */
 function closeWindow(stem) {
-    Application("Xcode").activate();
-    delay(0.3);
+    // No activate() needed — accessibility clicks work without focus
     var win = findGpuTraceWindow(stem, true);
     if (!win) {
         return jsonResult({closed: false, reason: "not-found"});
     }
     try {
-        // Click the close button (first button in window, which is the red close widget)
         var buttons = win.buttons();
         for (var i = 0; i < buttons.length; i++) {
             try {
-                var sr = buttons[i].subrole();
-                if (sr === "AXCloseButton") {
+                if (buttons[i].subrole() === "AXCloseButton") {
                     buttons[i].click();
-                    sendXcodeToBack();
                     return jsonResult({closed: true});
                 }
             } catch (e) {}
@@ -240,16 +221,9 @@ function closeWindow(stem) {
                 var desc = buttons[i].description();
                 if (desc && desc.toLowerCase().indexOf("close") >= 0) {
                     buttons[i].click();
-                    sendXcodeToBack();
                     return jsonResult({closed: true});
                 }
             } catch (e) {}
-        }
-        // Last resort: click first button (standard macOS close button position)
-        if (buttons.length > 0) {
-            buttons[0].click();
-            sendXcodeToBack();
-            return jsonResult({closed: true, method: "first-button"});
         }
         return jsonResult({closed: false, reason: "no-close-button"});
     } catch (e) {
@@ -261,8 +235,7 @@ function closeWindow(stem) {
  * ensure-replay: Navigate to Replay/Profile controls, enable profiling, click Replay.
  */
 function ensureReplay(stem) {
-    Application("Xcode").activate();
-    delay(0.3);
+    // No activate() needed — accessibility clicks work without focus
     var win = findGpuTraceWindow(stem);
     if (!win) {
         return jsonResult({replayed: false, profiled: false, error: "window-not-found"});
@@ -311,11 +284,9 @@ function ensureReplay(stem) {
         }
     }
 
-    // Click Replay, then send Xcode to back so it doesn't steal focus
+    // Click Replay
     try {
         replayBtn.click();
-        delay(0.3);
-        sendXcodeToBack();
         return jsonResult({replayed: true, profiled: profiled, error: null});
     } catch (e) {
         return jsonResult({replayed: false, profiled: profiled, error: "replay-click-failed: " + e.message});

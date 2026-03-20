@@ -657,7 +657,9 @@ def _replay_gputrace(gputrace_path: str, timeout: int = 120) -> str | None:
     # 2. Open gputrace in Xcode
     log.info("Opening %s in Xcode for replay...", abs_path)
     try:
-        subprocess.run(["open", "-a", "Xcode", abs_path], check=True, timeout=10)
+        subprocess.run(
+            ["open", "-g", "-a", "Xcode", abs_path], check=True, timeout=10,
+        )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         log.warning("Failed to open gputrace in Xcode: %s", e)
         return None
