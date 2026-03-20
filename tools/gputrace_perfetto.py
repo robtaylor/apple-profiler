@@ -830,44 +830,168 @@ def _pftrace_cb(data: dict[str, Any]) -> Any:
 
 _COUNTER_SEQ = 3
 
-# Counter name → GpuCounterGroup enum value mapping
-# Values: UNCLASSIFIED=0, SYSTEM=1, VERTICES=2, FRAGMENTS=3,
-#         PRIMITIVES=4, MEMORY=5, COMPUTE=6, RAY_TRACING=7
-#
-# These names come from the MIO timeline (GTMioTimelineCounters.counterForName:).
-_COUNTER_GROUPS: dict[str, int] = {
-    # AF = Apple Fabric (system memory interconnect) — MEMORY
-    "AF Bandwidth": 5,
-    "AF Peak Bandwidth": 5,
-    "AF Peak Read Bandwidth": 5,
-    "AF Peak Write Bandwidth": 5,
-    "AF Read Bandwidth": 5,
-    "AF Write Bandwidth": 5,
-    # L2 cache — MEMORY
-    "L2 Bandwidth": 5,
-    "L2 Cache Limiter": 5,
-    "L2 Cache Utilization": 5,
-    # MMU (Memory Management Unit) — MEMORY
-    "MMU Limiter": 5,
-    "MMU Utilization": 5,
-    # Texture — FRAGMENTS
-    "Texture Cache Limiter": 3,
-    "Texture Cache Utilization": 3,
-    "Texture Read Limiter": 3,
-    "Texture Read Utilization": 3,
-    "Texture Write Limiter": 3,
-    "Texture Write Utilization": 3,
-    "TextureFilteringLimiter": 3,
-    # Compression — MEMORY
-    "CompressionRatioTextureMemoryRead": 5,
-    # GPU core configuration — SYSTEM
-    "Active Cores": 1,
-    "Total Cores": 1,
+# Counter name → display group for Perfetto track grouping.
+# Counters in the same group appear under a collapsible parent track.
+# Names must match the keys in _COUNTER_CATEGORY_ORDER in gputrace_timeline.py.
+_COUNTER_GROUP_MAP: dict[str, str] = {
+    # GPU activity & cores
+    "GT Active Core Count": "GPU Activity",
+    # Occupancy
+    "Total Occupancy": "Occupancy",
+    "Compute Occupancy": "Occupancy",
+    "Fragment Occupancy": "Occupancy",
+    "Vertex Occupancy": "Occupancy",
+    "Occupancy Manager Target": "Occupancy",
+    "Total Simdgroups Inflight Per Shader Core": "Occupancy",
+    "Compute Simdgroups Inflight Per Shader Core": "Occupancy",
+    "Fragment Simdgroups Inflight Per Shader Core": "Occupancy",
+    "Vertex Simdgroups Inflight Per Shader Core": "Occupancy",
+    "Occupancy Management L1 Eviction Rate": "Occupancy",
+    # Memory bandwidth
+    "AF Bandwidth": "Memory Bandwidth",
+    "AF Read Bandwidth": "Memory Bandwidth",
+    "AF Write Bandwidth": "Memory Bandwidth",
+    "AF Peak Bandwidth": "Memory Bandwidth",
+    "AF Peak Read Bandwidth": "Memory Bandwidth",
+    "AF Peak Write Bandwidth": "Memory Bandwidth",
+    "L2 Bandwidth": "Memory Bandwidth",
+    # Shader core utilization & instruction throughput
+    "Shader Core Utilization": "Shader Utilization",
+    "Shader Core Limiter": "Shader Utilization",
+    "ALU Utilization": "Shader Utilization",
+    "F16 Utilization": "Shader Utilization",
+    "F16 Limiter": "Shader Utilization",
+    "F32 Utilization": "Shader Utilization",
+    "F32 Limiter": "Shader Utilization",
+    "IC Utilization": "Shader Utilization",
+    "IC Limiter": "Shader Utilization",
+    "SCIB Utilization": "Shader Utilization",
+    "SCIB Limiter": "Shader Utilization",
+    "Control Flow Utilization": "Shader Utilization",
+    "Control Flow Limiter": "Shader Utilization",
+    "Instruction Dispatch Utilization": "Shader Utilization",
+    "Instruction Dispatch Limiter": "Shader Utilization",
+    "Instruction Issue Utilization": "Shader Utilization",
+    "Instruction Issue Limiter": "Shader Utilization",
+    "Address Generation Utilization": "Shader Utilization",
+    "Address Generation Limiter": "Shader Utilization",
+    # Shader launch
+    "Compute Shader Launch Utilization": "Shader Launch",
+    "Compute Shader Launch Limiter": "Shader Launch",
+    "Fragment Shader Launch Utilization": "Shader Launch",
+    "Fragment Shader Launch Limiter": "Shader Launch",
+    "Vertex Shader Launch Utilization": "Shader Launch",
+    "Vertex Shader Launch Limiter": "Shader Launch",
+    # L1 cache bandwidth
+    "L1 Load Bandwidth": "L1 Cache",
+    "L1 Store Bandwidth": "L1 Cache",
+    "L1 Cache Utilization": "L1 Cache",
+    "L1 Cache Limiter": "L1 Cache",
+    "Buffer L1 Load Bandwidth": "L1 Cache",
+    "Buffer L1 Store Bandwidth": "L1 Cache",
+    "Buffer L1 Load Ratio": "L1 Cache",
+    "Buffer L1 Store Ratio": "L1 Cache",
+    "Buffer L1 Miss Rate": "L1 Cache",
+    "Imageblock L1 Load Bandwidth": "L1 Cache",
+    "Imageblock L1 Store Bandwidth": "L1 Cache",
+    "Imageblock L1 Load Ratio": "L1 Cache",
+    "Imageblock L1 Store Ratio": "L1 Cache",
+    "Threadgroup Memory L1 Load Bandwidth": "L1 Cache",
+    "Threadgroup Memory L1 Store Bandwidth": "L1 Cache",
+    "Threadgroup L1 Load Ratio": "L1 Cache",
+    "Threadgroup L1 Store Ratio": "L1 Cache",
+    "Stack L1 Load Bandwidth": "L1 Cache",
+    "Stack L1 Store Bandwidth": "L1 Cache",
+    "Stack L1 Load Ratio": "L1 Cache",
+    "Stack L1 Store Ratio": "L1 Cache",
+    "GPR L1 Load Bandwidth": "L1 Cache",
+    "GPR L1 Store Bandwidth": "L1 Cache",
+    "GPR L1 Read Ratio": "L1 Cache",
+    "GPR L1 Write Ratio": "L1 Cache",
+    "Other L1 Load Bandwidth": "L1 Cache",
+    "Other L1 Store Bandwidth": "L1 Cache",
+    "Other L1 Loads Ratio": "L1 Cache",
+    "Other L1 Stores Ratio": "L1 Cache",
+    # L1 residency
+    "L1 Total Occupancy": "L1 Residency",
+    "L1 Total Bytes Occupancy": "L1 Residency",
+    "L1 Buffer Occupancy": "L1 Residency",
+    "L1 Buffer Bytes Occupancy": "L1 Residency",
+    "L1 Imageblock Occupancy": "L1 Residency",
+    "L1 Imageblock Bytes Occupancy": "L1 Residency",
+    "L1 Threadgroup Occupancy": "L1 Residency",
+    "L1 Threadgroup Bytes Occupancy": "L1 Residency",
+    "L1 GPR Occupancy": "L1 Residency",
+    "L1 GPR Bytes Occupancy": "L1 Residency",
+    "L1 Stack Occupancy": "L1 Residency",
+    "L1 Stack Bytes Occupancy": "L1 Residency",
+    "L1 Other Occupancy": "L1 Residency",
+    "L1 Other Bytes Occupancy": "L1 Residency",
+    "L1 Raytracing Scratch Occupancy": "L1 Residency",
+    "L1 Raytracing Scratch Bytes Occupancy": "L1 Residency",
+    # L2 / texture / MMU
+    "L2 Cache Utilization": "L2 / Texture / MMU",
+    "L2 Cache Limiter": "L2 / Texture / MMU",
+    "Texture Cache Utilization": "L2 / Texture / MMU",
+    "Texture Cache Limiter": "L2 / Texture / MMU",
+    "Texture Read Utilization": "L2 / Texture / MMU",
+    "Texture Read Limiter": "L2 / Texture / MMU",
+    "Texture Write Utilization": "L2 / Texture / MMU",
+    "Texture Write Limiter": "L2 / Texture / MMU",
+    "TextureFilteringLimiter": "L2 / Texture / MMU",
+    "CompressionRatioTextureMemoryRead": "L2 / Texture / MMU",
+    "MMU Utilization": "L2 / Texture / MMU",
+    "MMU Limiter": "L2 / Texture / MMU",
+    # Raytracing
+    "Raytracing Active": "Raytracing",
+    "Raytracing Active GT": "Raytracing",
+    "Ray Occupancy": "Raytracing",
+    "Leaf Test Occupancy": "Raytracing",
+    "Ray T Leaf Test": "Raytracing",
+    "Raytracing Node Test": "Raytracing",
+    "Intersect Ray Threads": "Raytracing",
+    "Raytracing Scratch L1 Load Bandwidth": "Raytracing",
+    "Raytracing Scratch L1 Store Bandwidth": "Raytracing",
+    "Raytracing Scratch L1 Load Ratio": "Raytracing",
+    "Raytracing Scratch L1 Store Ratio": "Raytracing",
 }
+
+# Group display order in the Perfetto UI (lower = higher in the list)
+_GROUP_ORDER: list[str] = [
+    "GPU Activity",
+    "Occupancy",
+    "Memory Bandwidth",
+    "Shader Utilization",
+    "Shader Launch",
+    "L1 Cache",
+    "L1 Residency",
+    "L2 / Texture / MMU",
+    "Raytracing",
+]
+
+# Base UUID offset for counter tracks (must not collide with other track UUIDs)
+_COUNTER_UUID_BASE = 0x6700_0000
+
+
+def _counter_unit(name: str) -> str:
+    """Return a Perfetto unit_name string for a counter based on its name."""
+    if any(
+        kw in name
+        for kw in ("Utilization", "Limiter", "Percent", "Rate",
+                    "Occupancy", "Ratio", "Miss Rate", "Compression")
+    ):
+        return "percent"
+    if any(kw in name for kw in ("Bytes", "Bandwidth")):
+        return "bytes"
+    return ""
 
 
 def _add_gpu_counters(trace: Any, pb: Any, counters: dict[str, Any]) -> None:
-    """Append GpuCounterEvent packets to a Trace protobuf.
+    """Append grouped counter tracks to a Trace protobuf.
+
+    Creates collapsible track groups in the Perfetto UI using
+    TrackDescriptor parent/child relationships with TYPE_COUNTER
+    TrackEvents.
 
     Args:
         trace: pb.Trace() object to append to.
@@ -880,7 +1004,7 @@ def _add_gpu_counters(trace: Any, pb: Any, counters: dict[str, Any]) -> None:
     samples: list[list[float]] = counters["samples"]
     num_counters = len(counter_names)
 
-    # Identify non-zero counter indices (at least one sample has non-zero value)
+    # Identify non-zero counter indices (at least one sample > 0)
     nonzero_indices: list[int] = []
     for c in range(num_counters):
         if any(samples[s][c] != 0.0 for s in range(num_samples)):
@@ -889,43 +1013,83 @@ def _add_gpu_counters(trace: Any, pb: Any, counters: dict[str, Any]) -> None:
     if not nonzero_indices:
         return
 
-    # Descriptor packet (declares all counters, sent once)
-    desc_pkt = trace.packet.add()
-    desc_pkt.timestamp = 0
-    desc_pkt.trusted_packet_sequence_id = _COUNTER_SEQ
+    # Assign each counter to a group
+    group_rank = {g: i for i, g in enumerate(_GROUP_ORDER)}
+    ungrouped_name = "Other Counters"
 
+    # Collect which groups are actually used
+    used_groups: dict[str, list[int]] = {}  # group_name → [counter indices]
     for c in nonzero_indices:
         name = counter_names[c]
-        spec = desc_pkt.gpu_counter_event.counter_descriptor.specs.add()
-        spec.counter_id = c
-        spec.name = name
+        group = _COUNTER_GROUP_MAP.get(name, ungrouped_name)
+        used_groups.setdefault(group, []).append(c)
 
-        # Assign unit based on name pattern
-        if "Utilization" in name or "Limiter" in name or "Percent" in name or "Rate" in name:
-            spec.numerator_units.append(pb.GpuCounterDescriptor.PERCENT)
-        elif "Bytes" in name or "Bandwidth" in name or "Throughput" in name or "Traffic" in name:
-            spec.numerator_units.append(pb.GpuCounterDescriptor.BYTE)
-        else:
-            spec.numerator_units.append(pb.GpuCounterDescriptor.NONE)
+    # Sort groups: known order first, then "Other Counters" last
+    sorted_groups = sorted(
+        used_groups.keys(),
+        key=lambda g: (group_rank.get(g, len(_GROUP_ORDER)), g),
+    )
 
-        # Assign group
-        group = _COUNTER_GROUPS.get(name, 0)  # 0 = UNCLASSIFIED
-        spec.groups.append(group)
+    # Allocate UUIDs for groups and counters
+    group_uuids: dict[str, int] = {}
+    counter_uuids: dict[int, int] = {}
+    next_uuid = _COUNTER_UUID_BASE
 
-    desc_pkt.gpu_counter_event.gpu_id = 0
+    for group_name in sorted_groups:
+        group_uuids[group_name] = next_uuid
+        next_uuid += 1
+        for c in used_groups[group_name]:
+            counter_uuids[c] = next_uuid
+            next_uuid += 1
 
-    # Sample packets (one per timestamp, with all non-zero counter values)
-    for s in range(num_samples):
+    # Top-level "GPU Counters" track that groups everything
+    root_uuid = _COUNTER_UUID_BASE - 1
+    root_pkt = trace.packet.add()
+    root_pkt.timestamp = 0
+    root_pkt.trusted_packet_sequence_id = _COUNTER_SEQ
+    root_td = root_pkt.track_descriptor
+    root_td.uuid = root_uuid
+    root_td.name = "GPU Counters"
+    root_td.child_ordering = pb.TrackDescriptor.EXPLICIT
+
+    # Emit TrackDescriptor packets for groups and counters
+    for group_rank_idx, group_name in enumerate(sorted_groups):
+        # Parent group track
         pkt = trace.packet.add()
-        pkt.timestamp = timestamps_ns[s]
+        pkt.timestamp = 0
         pkt.trusted_packet_sequence_id = _COUNTER_SEQ
+        td = pkt.track_descriptor
+        td.uuid = group_uuids[group_name]
+        td.parent_uuid = root_uuid
+        td.name = group_name
+        td.sibling_order_rank = group_rank_idx
+        td.child_ordering = pb.TrackDescriptor.EXPLICIT
 
+        # Child counter tracks
+        for child_rank, c in enumerate(used_groups[group_name]):
+            name = counter_names[c]
+            pkt = trace.packet.add()
+            pkt.timestamp = 0
+            pkt.trusted_packet_sequence_id = _COUNTER_SEQ
+            td = pkt.track_descriptor
+            td.uuid = counter_uuids[c]
+            td.parent_uuid = group_uuids[group_name]
+            td.name = name
+            td.sibling_order_rank = child_rank
+            unit = _counter_unit(name)
+            if unit:
+                td.counter.unit_name = unit
+
+    # Emit counter values as TrackEvent TYPE_COUNTER packets
+    for s in range(num_samples):
+        ts = timestamps_ns[s]
         for c in nonzero_indices:
-            counter = pkt.gpu_counter_event.counters.add()
-            counter.counter_id = c
-            counter.double_value = samples[s][c]
-
-        pkt.gpu_counter_event.gpu_id = 0
+            pkt = trace.packet.add()
+            pkt.timestamp = ts
+            pkt.trusted_packet_sequence_id = _COUNTER_SEQ
+            pkt.track_event.type = pb.TrackEvent.TYPE_COUNTER
+            pkt.track_event.track_uuid = counter_uuids[c]
+            pkt.track_event.double_counter_value = samples[s][c]
 
 
 # ---------------------------------------------------------------------------

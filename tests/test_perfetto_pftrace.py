@@ -650,19 +650,36 @@ def _gpu_counter_events(trace: pb.Trace) -> list:
     return [p for p in trace.packet if p.HasField("gpu_counter_event")]
 
 
-def _counter_descriptor_pkts(trace: pb.Trace) -> list:
-    """Extract gpu_counter_event packets that have a counter_descriptor with specs."""
+def _counter_track_descriptors(trace: pb.Trace) -> list:
+    """Extract TrackDescriptor packets that define counter tracks (have counter field)."""
     return [
-        p for p in _gpu_counter_events(trace)
-        if len(p.gpu_counter_event.counter_descriptor.specs) > 0
+        p for p in trace.packet
+        if p.HasField("track_descriptor") and p.track_descriptor.HasField("counter")
     ]
 
 
-def _counter_sample_pkts(trace: pb.Trace) -> list:
-    """Extract gpu_counter_event packets that have counter values (not descriptor-only)."""
+def _counter_group_descriptors(trace: pb.Trace) -> list:
+    """Extract TrackDescriptor packets that are counter group parents."""
+    # Group descriptors have parent_uuid set but no counter field
+    parent_uuids = {
+        p.track_descriptor.parent_uuid
+        for p in trace.packet
+        if p.HasField("track_descriptor") and p.track_descriptor.parent_uuid != 0
+    }
     return [
-        p for p in _gpu_counter_events(trace)
-        if len(p.gpu_counter_event.counters) > 0
+        p for p in trace.packet
+        if p.HasField("track_descriptor")
+        and p.track_descriptor.uuid in parent_uuids
+        and not p.track_descriptor.HasField("counter")
+    ]
+
+
+def _counter_event_pkts(trace: pb.Trace) -> list:
+    """Extract TrackEvent packets of TYPE_COUNTER."""
+    return [
+        p for p in trace.packet
+        if p.HasField("track_event")
+        and p.track_event.type == pb.TrackEvent.TYPE_COUNTER
     ]
 
 
@@ -681,116 +698,118 @@ _COUNTER_DATA = {
 
 
 class TestPftraceCounterTracks:
-    """GPU performance counter tracks via GpuCounterEvent."""
+    """GPU performance counter tracks via grouped TrackDescriptor + TrackEvent."""
 
     def test_counters_none(self):
-        """counters=None produces no gpu_counter_event packets."""
+        """counters=None produces no counter track descriptors or events."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=None)
         trace = _parse_trace(raw)
-        assert len(_gpu_counter_events(trace)) == 0
+        assert len(_counter_track_descriptors(trace)) == 0
+        assert len(_counter_event_pkts(trace)) == 0
 
-    def test_counter_descriptor_specs(self):
-        """First gpu_counter_event has descriptor with 3 specs (FSVertexCount filtered)."""
+    def test_counter_track_descriptors(self):
+        """3 counter track descriptors (AF Peak Bandwidth filtered as all-zero)."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
         trace = _parse_trace(raw)
-        desc_pkts = _counter_descriptor_pkts(trace)
-        assert len(desc_pkts) == 1
-        specs = list(desc_pkts[0].gpu_counter_event.counter_descriptor.specs)
-        assert len(specs) == 3
+        descs = _counter_track_descriptors(trace)
+        assert len(descs) == 3
 
     def test_counter_spec_names(self):
-        """Spec names match counter_names excluding zero-only counters."""
+        """Track names match counter_names excluding zero-only counters."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
         trace = _parse_trace(raw)
-        desc_pkts = _counter_descriptor_pkts(trace)
-        specs = list(desc_pkts[0].gpu_counter_event.counter_descriptor.specs)
-        names = {s.name for s in specs}
+        descs = _counter_track_descriptors(trace)
+        names = {d.track_descriptor.name for d in descs}
         assert names == {"L2 Cache Utilization", "AF Bandwidth", "L2 Cache Limiter"}
 
     def test_counter_spec_groups(self):
-        """L2 Cache Utilization→MEMORY(5), AF Bandwidth→MEMORY(5), L2 Cache Limiter→MEMORY(5)."""
+        """Counters are grouped under parent TrackDescriptor tracks."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
         trace = _parse_trace(raw)
-        desc_pkts = _counter_descriptor_pkts(trace)
-        desc = desc_pkts[0].gpu_counter_event.counter_descriptor
-        specs = {s.name: list(s.groups) for s in desc.specs}
-        assert specs["L2 Cache Utilization"] == [5]  # MEMORY
-        assert specs["AF Bandwidth"] == [5]          # MEMORY
-        assert specs["L2 Cache Limiter"] == [5]      # MEMORY
+        groups = _counter_group_descriptors(trace)
+        group_names = {g.track_descriptor.name for g in groups}
+        # L2 Cache Util/Limiter → "L2 / Texture / MMU", AF Bandwidth → "Memory Bandwidth"
+        assert "L2 / Texture / MMU" in group_names
+        assert "Memory Bandwidth" in group_names
 
     def test_counter_spec_units(self):
-        """L2 Cache Utilization→PERCENT(37), AF Bandwidth→BYTE(7), L2 Cache Limiter→PERCENT(37)."""
+        """L2 Cache Utilization→percent, AF Bandwidth→bytes, L2 Cache Limiter→percent."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
         trace = _parse_trace(raw)
-        desc_pkts = _counter_descriptor_pkts(trace)
-        specs = {
-            s.name: list(s.numerator_units)
-            for s in desc_pkts[0].gpu_counter_event.counter_descriptor.specs
+        descs = _counter_track_descriptors(trace)
+        units = {
+            d.track_descriptor.name: d.track_descriptor.counter.unit_name
+            for d in descs
         }
-        assert specs["L2 Cache Utilization"] == [37]  # PERCENT
-        assert specs["AF Bandwidth"] == [7]           # BYTE
-        assert specs["L2 Cache Limiter"] == [37]      # PERCENT
+        assert units["L2 Cache Utilization"] == "percent"
+        assert units["AF Bandwidth"] == "bytes"
+        assert units["L2 Cache Limiter"] == "percent"
 
     def test_counter_sample_packets(self):
-        """3 sample packets, each with 3 GpuCounter entries."""
+        """3 counters x 3 timestamps = 9 TYPE_COUNTER TrackEvent packets."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
         trace = _parse_trace(raw)
-        sample_pkts = _counter_sample_pkts(trace)
-        assert len(sample_pkts) == 3
-        for pkt in sample_pkts:
-            assert len(pkt.gpu_counter_event.counters) == 3
+        events = _counter_event_pkts(trace)
+        assert len(events) == 9  # 3 counters × 3 samples
 
     def test_counter_sample_timestamps(self):
-        """Packet timestamps match timestamps_ns."""
+        """Counter event timestamps match timestamps_ns."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
         trace = _parse_trace(raw)
-        sample_pkts = _counter_sample_pkts(trace)
-        timestamps = sorted(p.timestamp for p in sample_pkts)
+        events = _counter_event_pkts(trace)
+        timestamps = sorted({p.timestamp for p in events})
         assert timestamps == [1000000, 2000000, 3000000]
 
     def test_counter_sample_values(self):
-        """double_value matches sample values for first sample."""
+        """double_counter_value matches sample values for first timestamp."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
         trace = _parse_trace(raw)
-        sample_pkts = _counter_sample_pkts(trace)
-        # Find the first sample (timestamp=1000000)
-        first = [p for p in sample_pkts if p.timestamp == 1000000]
-        assert len(first) == 1
-        values = {
-            c.counter_id: c.double_value
-            for c in first[0].gpu_counter_event.counters
+        events = _counter_event_pkts(trace)
+        # Build uuid→name map from track descriptors
+        uuid_to_name = {
+            d.track_descriptor.uuid: d.track_descriptor.name
+            for d in _counter_track_descriptors(trace)
         }
-        # counter_id 0=L2 Cache Utilization, 1=AF Bandwidth, 2=L2 Cache Limiter
-        assert abs(values[0] - 0.85) < 1e-5
-        assert abs(values[1] - 1234567.0) < 1e-1
-        assert abs(values[2] - 0.42) < 1e-5
+        # Get values at first timestamp
+        first = [p for p in events if p.timestamp == 1000000]
+        assert len(first) == 3
+        values = {
+            uuid_to_name[p.track_event.track_uuid]: p.track_event.double_counter_value
+            for p in first
+        }
+        assert abs(values["L2 Cache Utilization"] - 0.85) < 1e-5
+        assert abs(values["AF Bandwidth"] - 1234567.0) < 1e-1
+        assert abs(values["L2 Cache Limiter"] - 0.42) < 1e-5
 
     def test_counter_zero_filtering(self):
-        """All-zero counter (AF Peak Bandwidth) absent from both descriptor and samples."""
+        """All-zero counter (AF Peak Bandwidth) absent from descriptors and events."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
         trace = _parse_trace(raw)
-        # Check descriptor
-        desc_pkts = _counter_descriptor_pkts(trace)
-        spec_names = {s.name for s in desc_pkts[0].gpu_counter_event.counter_descriptor.specs}
-        assert "AF Peak Bandwidth" not in spec_names
-        # Check samples: counter_id 3 (AF Peak Bandwidth) should not appear
-        sample_pkts = _counter_sample_pkts(trace)
-        for pkt in sample_pkts:
-            counter_ids = {c.counter_id for c in pkt.gpu_counter_event.counters}
-            assert 3 not in counter_ids
+        # Check descriptors
+        desc_names = {
+            d.track_descriptor.name for d in _counter_track_descriptors(trace)
+        }
+        assert "AF Peak Bandwidth" not in desc_names
+        # Check events: no track_uuid for AF Peak Bandwidth
+        counter_uuids = {
+            d.track_descriptor.uuid
+            for d in _counter_track_descriptors(trace)
+        }
+        for pkt in _counter_event_pkts(trace):
+            assert pkt.track_event.track_uuid in counter_uuids
 
     def test_counters_pipeline_mode(self):
-        """gpu_counter_event packets appear alongside GpuRenderStageEvent in pipeline output."""
+        """Counter tracks appear alongside GpuRenderStageEvent in pipeline output."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="pipeline", counters=_COUNTER_DATA)
         trace = _parse_trace(raw)
-        # Should have both GPU render stage events AND counter events
         assert len(_gpu_events(trace)) == 5  # dispatches
-        assert len(_gpu_counter_events(trace)) == 4  # 1 descriptor + 3 samples
+        assert len(_counter_track_descriptors(trace)) == 3
+        assert len(_counter_event_pkts(trace)) == 9
 
     def test_counters_cb_mode(self):
-        """gpu_counter_event packets appear alongside TrackEvent in CB output."""
+        """Counter tracks appear alongside TrackEvent slices in CB output."""
         raw = timeline_to_pftrace(_COMPLEX_DATA, group_by="cb", counters=_COUNTER_DATA)
         trace = _parse_trace(raw)
-        # Should have track events (dispatches/barriers/spans) AND counter events
         assert len(_track_events(trace)) > 0
-        assert len(_gpu_counter_events(trace)) == 4  # 1 descriptor + 3 samples
+        assert len(_counter_track_descriptors(trace)) == 3
+        assert len(_counter_event_pkts(trace)) == 9
