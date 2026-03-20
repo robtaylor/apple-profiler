@@ -6,6 +6,28 @@
 //   close-window <stem>   — Close the gputrace window matching <stem>
 //   ensure-replay <stem>  — Check Profile checkbox, click Replay
 //   poll-activity         — Check Activity View for GPU profiling status
+//
+// IMPORTANT: Xcode has two completely different UI states for a .gputrace:
+//
+//   1. Initial capture view — has "Replay" button and "Profile after replay"
+//      checkbox in the editor area. This is the state when the file is first
+//      opened. Accessibility path:
+//        window → splitterGroups[0] → groups("editor area") → splitterGroups[0]
+//        → groups("New Editor") → splitterGroups[0] → splitterGroups[0]
+//        → groups(<stem>) → splitterGroups[0] → {checkbox, button}
+//
+//   2. GPU debugger view — after replay completes (or if the file was
+//      previously replayed), Xcode switches to the Debug Navigator with an
+//      outline tree. There is NO Replay button in this state. Hierarchy:
+//        window [IDEWorkspaceWindow]
+//        → splitterGroups[0] [IDEWorkspaceDesignAreaSplitView]
+//          → navigator [IDENavigatorArea]
+//            → Debug Navigator [IDEDebugNavigatorOutlineView]
+//              → outline rows → cells (trace name, etc.)
+//
+//   If the gputrace is already open in state 2, `open -a Xcode <file>` does
+//   NOT reset it to state 1. The window must be CLOSED first and then
+//   reopened to get back to the initial capture view with the Replay button.
 
 "use strict";
 
@@ -34,11 +56,31 @@ function jsonResult(obj) {
 }
 
 /**
- * Find the gputrace window whose title contains `stem`.
+ * Send Xcode to the back so it doesn't steal focus from the terminal.
+ * Uses System Events to set Xcode's frontmost to false.
  */
-function findGpuTraceWindow(stem) {
+function sendXcodeToBack() {
+    try {
+        xcode.frontmost = false;
+        // Also tell the frontmost app to activate (usually Terminal/iTerm)
+        var frontApps = se.processes.whose({frontmost: true})();
+        if (frontApps.length > 0) {
+            Application(frontApps[0].name()).activate();
+        }
+    } catch (e) { /* best effort */ }
+}
+
+/**
+ * Find the gputrace window whose title contains `stem`.
+ *
+ * After replay, Xcode changes the window title to "" (empty string) when
+ * entering the GPU debugger state. The `allowEmpty` flag enables matching
+ * empty-named windows as a last resort (used by close-window).
+ */
+function findGpuTraceWindow(stem, allowEmpty) {
     var wins;
     try { wins = xcode.windows(); } catch (e) { return null; }
+    // Exact match: stem + .gputrace in title
     for (var i = 0; i < wins.length; i++) {
         try {
             var name = wins[i].name();
@@ -55,6 +97,18 @@ function findGpuTraceWindow(stem) {
                 return wins[i];
             }
         } catch (e) {}
+    }
+    // Last resort: after replay the window name becomes "" — match any
+    // empty-named window if there's exactly one (avoids closing wrong window)
+    if (allowEmpty) {
+        var emptyWins = [];
+        for (var i = 0; i < wins.length; i++) {
+            try {
+                var name = wins[i].name();
+                if (name === "" || name === null) emptyWins.push(wins[i]);
+            } catch (e) {}
+        }
+        if (emptyWins.length === 1) return emptyWins[0];
     }
     return null;
 }
@@ -158,11 +212,12 @@ function findElementRecursive(element, role, name, depth) {
 
 /**
  * close-window: Find and close the gputrace window.
+ * Uses allowEmpty=true since after replay the window title becomes "".
  */
 function closeWindow(stem) {
     Application("Xcode").activate();
     delay(0.3);
-    var win = findGpuTraceWindow(stem);
+    var win = findGpuTraceWindow(stem, true);
     if (!win) {
         return jsonResult({closed: false, reason: "not-found"});
     }
@@ -174,6 +229,7 @@ function closeWindow(stem) {
                 var sr = buttons[i].subrole();
                 if (sr === "AXCloseButton") {
                     buttons[i].click();
+                    sendXcodeToBack();
                     return jsonResult({closed: true});
                 }
             } catch (e) {}
@@ -184,6 +240,7 @@ function closeWindow(stem) {
                 var desc = buttons[i].description();
                 if (desc && desc.toLowerCase().indexOf("close") >= 0) {
                     buttons[i].click();
+                    sendXcodeToBack();
                     return jsonResult({closed: true});
                 }
             } catch (e) {}
@@ -191,6 +248,7 @@ function closeWindow(stem) {
         // Last resort: click first button (standard macOS close button position)
         if (buttons.length > 0) {
             buttons[0].click();
+            sendXcodeToBack();
             return jsonResult({closed: true, method: "first-button"});
         }
         return jsonResult({closed: false, reason: "no-close-button"});
@@ -253,13 +311,79 @@ function ensureReplay(stem) {
         }
     }
 
-    // Click Replay
+    // Click Replay, then send Xcode to back so it doesn't steal focus
     try {
         replayBtn.click();
+        delay(0.3);
+        sendXcodeToBack();
         return jsonResult({replayed: true, profiled: profiled, error: null});
     } catch (e) {
         return jsonResult({replayed: false, profiled: profiled, error: "replay-click-failed: " + e.message});
     }
+}
+
+/**
+ * Find the Activity View group in a toolbar, searching up to 2 levels deep.
+ * Xcode nests it as: toolbar → groups[1] → groups[0] ("Activity View")
+ */
+function findActivityView(toolbar) {
+    var topGroups;
+    try { topGroups = toolbar.groups(); } catch (e) { return null; }
+    for (var i = 0; i < topGroups.length; i++) {
+        try {
+            if (topGroups[i].description() === "Activity View") return topGroups[i];
+        } catch (e) {}
+        // Check nested groups
+        try {
+            var subGroups = topGroups[i].groups();
+            for (var j = 0; j < subGroups.length; j++) {
+                try {
+                    if (subGroups[j].description() === "Activity View") return subGroups[j];
+                } catch (e) {}
+            }
+        } catch (e) {}
+    }
+    return null;
+}
+
+/**
+ * Read status from an Activity View group.
+ */
+function readActivityStatus(av) {
+    var texts = [];
+    try {
+        var staticTexts = av.staticTexts();
+        for (var si = 0; si < staticTexts.length; si++) {
+            try { texts.push(staticTexts[si].value()); } catch (e) {}
+        }
+    } catch (e) {}
+
+    var statusText = texts.join(" | ");
+    var gpuKeywords = ["Debugging GPU", "Profiling", "GPU Workload", "Replaying"];
+    var isActive = false;
+    for (var ki = 0; ki < gpuKeywords.length; ki++) {
+        if (statusText.indexOf(gpuKeywords[ki]) >= 0) {
+            isActive = true;
+            break;
+        }
+    }
+
+    // Check for MultiActionIndicator (activity spinner with "Actions, N")
+    var hasIndicator = false;
+    try {
+        var btns = av.buttons();
+        for (var bi = 0; bi < btns.length; bi++) {
+            try {
+                var bDesc = btns[bi].description();
+                if (bDesc && bDesc.indexOf("Actions") >= 0) {
+                    hasIndicator = true;
+                    break;
+                }
+            } catch (e) {}
+        }
+    } catch (e) {}
+
+    return {active: isActive || hasIndicator, status: statusText || "idle", hasIndicator: hasIndicator};
 }
 
 /**
@@ -275,54 +399,8 @@ function pollActivity() {
         var toolbars;
         try { toolbars = wins[wi].toolbars(); } catch (e) { continue; }
         for (var ti = 0; ti < toolbars.length; ti++) {
-            var tGroups;
-            try { tGroups = toolbars[ti].groups(); } catch (e) { continue; }
-            for (var gi = 0; gi < tGroups.length; gi++) {
-                try {
-                    var desc = tGroups[gi].description();
-                    if (!desc || desc.indexOf("Activity View") < 0) continue;
-
-                    // Found Activity View — check for GPU-related status
-                    var texts = [];
-                    try {
-                        var staticTexts = tGroups[gi].staticTexts();
-                        for (var si = 0; si < staticTexts.length; si++) {
-                            try { texts.push(staticTexts[si].value()); } catch (e) {}
-                        }
-                    } catch (e) {}
-
-                    var statusText = texts.join(" | ");
-                    var gpuKeywords = ["Debugging GPU", "Profiling", "GPU Workload", "Replaying"];
-                    var isActive = false;
-                    for (var ki = 0; ki < gpuKeywords.length; ki++) {
-                        if (statusText.indexOf(gpuKeywords[ki]) >= 0) {
-                            isActive = true;
-                            break;
-                        }
-                    }
-
-                    // Also check for MultiActionIndicator (activity spinner)
-                    var hasIndicator = false;
-                    try {
-                        var btns = tGroups[gi].buttons();
-                        for (var bi = 0; bi < btns.length; bi++) {
-                            try {
-                                var bName = btns[bi].name();
-                                if (bName && bName.indexOf("Actions") >= 0) {
-                                    hasIndicator = true;
-                                    break;
-                                }
-                            } catch (e) {}
-                        }
-                    } catch (e) {}
-
-                    return jsonResult({
-                        active: isActive || hasIndicator,
-                        status: statusText || "idle",
-                        hasIndicator: hasIndicator
-                    });
-                } catch (e) { continue; }
-            }
+            var av = findActivityView(toolbars[ti]);
+            if (av) return jsonResult(readActivityStatus(av));
         }
     }
     return jsonResult({active: false, status: "activity-view-not-found"});

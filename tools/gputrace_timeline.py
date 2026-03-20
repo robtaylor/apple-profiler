@@ -686,7 +686,11 @@ def _replay_gputrace(gputrace_path: str, timeout: int = 120) -> str | None:
     # 4. Snapshot existing streamData files
     before = _snapshot_stream_data()
 
-    # 5. Poll for completion: filesystem check + Activity View logging
+    # 5. Poll for completion: Activity View + filesystem
+    # When Xcode finishes profiling, the Activity View changes to
+    # "Debugging GPU Workload" — at that point we close the window and
+    # then wait for streamData to appear on the filesystem.
+    window_closed = False
     for i in range(timeout):
         time.sleep(1)
 
@@ -698,21 +702,29 @@ def _replay_gputrace(gputrace_path: str, timeout: int = 120) -> str | None:
                 "Profiling complete after %ds: %s (%d bytes)",
                 i + 1, new_sd, sd_path.stat().st_size,
             )
-            # 6. Close gputrace window
-            _run_jxa("close-window", stem)
+            if not window_closed:
+                _run_jxa("close-window", stem)
             return new_sd
 
-        # Log progress from Activity View periodically
-        if i % 10 == 9:
-            status = _run_jxa("poll-activity")
-            status_text = "unknown"
-            if isinstance(status, dict):
-                status_text = status.get("status", "unknown")
-            log.info("  ... %ds — Xcode: %s", i + 1, status_text)
+        # Check Activity View for profiling completion
+        status = _run_jxa("poll-activity")
+        if isinstance(status, dict):
+            status_text = status.get("status", "")
+            # "Debugging GPU Workload" means replay+profiling finished
+            # and Xcode entered the GPU debugger — close the window
+            if not window_closed and "Debugging GPU" in status_text:
+                log.info(
+                    "Xcode entered GPU debugger after %ds — closing window",
+                    i + 1,
+                )
+                _run_jxa("close-window", stem)
+                window_closed = True
+            elif i % 10 == 9:
+                log.info("  ... %ds — Xcode: %s", i + 1, status_text)
 
     log.warning("Profiling did not complete within %ds", timeout)
-    # Clean up: close the window even on timeout
-    _run_jxa("close-window", stem)
+    if not window_closed:
+        _run_jxa("close-window", stem)
     return None
 
 
