@@ -899,8 +899,22 @@ def read_gputrace_counters(
     log.info("Processing streamData via MIO pipeline (this may take a moment)...")
     processor = GTShaderProfilerStreamDataProcessor.alloc() \
         .initWithStreamData_llvmHelperPath_(sd, _LLVM_HELPER_PATH)
-    processor.processStreamData()
-    processor.waitUntilFinished()
+
+    # Suppress noisy GTLLVMHelper stderr/stdout (LLVM warnings, GPU core info)
+    saved_stderr = os.dup(2)
+    saved_stdout = os.dup(1)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    os.dup2(devnull, 1)
+    try:
+        processor.processStreamData()
+        processor.waitUntilFinished()
+    finally:
+        os.dup2(saved_stderr, 2)
+        os.dup2(saved_stdout, 1)
+        os.close(saved_stderr)
+        os.close(saved_stdout)
+        os.close(devnull)
 
     mio = processor.mioData()
     if mio is None:
