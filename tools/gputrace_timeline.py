@@ -730,35 +730,28 @@ def _replay_gputrace(gputrace_path: str, timeout: int = 120) -> str | None:
     return None
 
 
-# Known MIO timeline counter names (discovered via framework binary strings).
-# These are the human-readable names accepted by GTMioTimelineCounters.counterForName:.
-_MIO_COUNTER_NAMES: list[str] = [
-    "AF Bandwidth",
-    "AF Peak Bandwidth",
-    "AF Peak Read Bandwidth",
-    "AF Peak Write Bandwidth",
-    "AF Read Bandwidth",
-    "AF Write Bandwidth",
-    "CompressionRatioTextureMemoryRead",
-    "L2 Bandwidth",
-    "L2 Cache Limiter",
-    "L2 Cache Utilization",
-    "MMU Limiter",
-    "MMU Utilization",
-    "Texture Cache Limiter",
-    "Texture Cache Utilization",
-    "Texture Read Limiter",
-    "Texture Read Utilization",
-    "Texture Write Limiter",
-    "Texture Write Utilization",
-    "TextureFilteringLimiter",
-]
-
 # LLVM helper path required by GTShaderProfilerStreamDataProcessor
 _LLVM_HELPER_PATH = (
     "/Applications/Xcode.app/Contents/Developer/Platforms/"
     "MacOSX.platform/Developer/Library/GPUToolsPlatform/PlugIns/GTLLVMHelper"
 )
+
+
+def _resample_nearest(
+    src_ts: list[int],
+    src_vals: list[float],
+    dst_ts: list[int],
+) -> list[float]:
+    """Resample src values to dst timestamps via nearest-neighbor."""
+    result: list[float] = []
+    j = 0
+    n = len(src_ts)
+    for t in dst_ts:
+        # Advance j while next source timestamp is closer
+        while j < n - 1 and abs(src_ts[j + 1] - t) <= abs(src_ts[j] - t):
+            j += 1
+        result.append(src_vals[j])
+    return result
 
 
 def _extract_mio_counter(
@@ -891,6 +884,13 @@ def read_gputrace_counters(
         log.warning("Failed to unarchive streamData")
         return None
 
+    # Set _dataFileURL so processAPSTimelineData can find external raw files
+    # (Counter_f_N.raw, Timeline_f_N.raw, etc.) in the streamData directory.
+    from Foundation import NSURL  # type: ignore[import-untyped]
+
+    base_dir = os.path.dirname(stream_path)
+    sd.setValue_forKey_(NSURL.fileURLWithPath_(base_dir), "_dataFileURL")
+
     # Process via GTShaderProfilerStreamDataProcessor → MIO data path
     if not os.path.exists(_LLVM_HELPER_PATH):
         log.warning("LLVM helper not found at %s", _LLVM_HELPER_PATH)
@@ -909,6 +909,8 @@ def read_gputrace_counters(
     try:
         processor.processStreamData()
         processor.waitUntilFinished()
+        processor.processAPSTimelineData()
+        processor.processAPSCostData()
     finally:
         os.dup2(saved_stderr, 2)
         os.dup2(saved_stdout, 1)
@@ -916,15 +918,19 @@ def read_gputrace_counters(
         os.close(saved_stdout)
         os.close(devnull)
 
-    mio = processor.mioData()
+    proc_result = processor.result()
+    if proc_result is None:
+        log.warning("Processor result is None — processing may have failed")
+        return None
+    mio = proc_result.mioData()
     if mio is None:
         log.warning("MIO data is None — processing may have failed")
         return None
 
     mio.loadTimeline()
-    timeline = mio.overlappingTimeline()
+    timeline = mio.nonOverlappingTimeline()
     if timeline is None:
-        log.warning("No overlapping timeline in MIO data")
+        log.warning("No nonOverlappingTimeline in MIO data")
         return None
 
     if timeline.profiledState() != 2:
@@ -952,57 +958,71 @@ def read_gputrace_counters(
         log.warning("No timeline counters available")
         return None
 
-    # Discover available counters by probing known names
-    counter_names: list[str] = []
-    counter_objects: list[Any] = []
-    for name in _MIO_COUNTER_NAMES:
-        try:
-            c = tc.counterForName_(name)
-            if c is not None and c.sampleCount() > 0:
-                counter_names.append(name)
-                counter_objects.append(c)
-        except Exception:
-            pass
-
-    if not counter_names:
-        log.info("No counters found with known names")
+    counters_dict = tc.counters()
+    if counters_dict is None or not hasattr(counters_dict, "allKeys"):
+        log.warning("No counters dict available on timelineCounters")
         return None
 
-    # All counters should have the same sample count
-    num_samples = counter_objects[0].sampleCount()
+    # Enumerate all available counters from the dict.
+    # Counters may have different sample counts (e.g. per-core vs system-wide),
+    # so we group by sample count and use the largest group.
+    all_keys = counters_dict.allKeys()
+    by_sample_count: dict[int, list[tuple[str, Any]]] = {}
+    for i in range(all_keys.count()):
+        name = str(all_keys.objectAtIndex_(i))
+        c_obj = counters_dict.objectForKey_(name)
+        sc = c_obj.sampleCount()
+        if sc <= 0:
+            continue
+        # Skip all-zero counters (reduces noise in output)
+        if c_obj.minValue() == 0.0 and c_obj.maxValue() == 0.0:
+            continue
+        by_sample_count.setdefault(sc, []).append((name, c_obj))
 
-    # Extract timestamps from the first counter (shared across all)
+    if not by_sample_count:
+        log.info("No non-zero counters found")
+        return None
+
+    # Use the group with the most counters as the primary set
+    primary_sc = max(by_sample_count, key=lambda sc: len(by_sample_count[sc]))
+    primary_counters = sorted(by_sample_count[primary_sc], key=lambda x: x[0])
+    num_samples = primary_sc
+
+    # Also include counters with different sample counts by resampling
+    # to the primary sample count via nearest-neighbor on timestamps
+    other_counters: list[tuple[str, Any]] = []
+    for sc, items in sorted(by_sample_count.items()):
+        if sc != primary_sc:
+            other_counters.extend(items)
+    other_counters.sort(key=lambda x: x[0])
+
+    counter_names: list[str] = [name for name, _ in primary_counters]
+    counter_objects: list[Any] = [obj for _, obj in primary_counters]
+
+    # Extract timestamps from the first counter (shared across all in group)
     timestamps, _ = _extract_mio_counter(counter_objects[0], num_samples)
 
-    # Extract values for each counter
+    # Extract values for each primary counter
     samples: list[list[float]] = [[] for _ in range(num_samples)]
     for ci, c_obj in enumerate(counter_objects):
-        assert c_obj.sampleCount() == num_samples, (
-            f"Counter {counter_names[ci]} has {c_obj.sampleCount()} samples, "
-            f"expected {num_samples}"
-        )
         _, values = _extract_mio_counter(c_obj, num_samples)
         for s in range(num_samples):
             samples[s].append(values[s])
 
-    # Extract Active Cores / Total Cores from costTimeline (constant values)
-    cost_tl = mio.costTimeline()
-    if cost_tl is not None:
-        sampled_cores = int(cost_tl.sampledCores())
-        total_cores = int(cost_tl.totalCores())
-        if sampled_cores > 0:
-            counter_names.append("Active Cores")
-            for s in range(num_samples):
-                samples[s].append(float(sampled_cores))
-            log.info("Active Cores: %d (of %d total)", sampled_cores, total_cores)
-        if total_cores > 0:
-            counter_names.append("Total Cores")
-            for s in range(num_samples):
-                samples[s].append(float(total_cores))
+    # Resample other-rate counters to primary timestamps via nearest-neighbor
+    for name, c_obj in other_counters:
+        other_sc = c_obj.sampleCount()
+        other_ts, other_vals = _extract_mio_counter(c_obj, other_sc)
+        resampled = _resample_nearest(other_ts, other_vals, timestamps)
+        counter_names.append(name)
+        for s in range(num_samples):
+            samples[s].append(resampled[s])
 
     log.info(
-        "Extracted %d counters x %d samples from MIO timeline",
+        "Extracted %d counters x %d samples from MIO timeline "
+        "(%d primary-rate, %d resampled)",
         len(counter_names), num_samples,
+        len(primary_counters), len(other_counters),
     )
 
     return {
