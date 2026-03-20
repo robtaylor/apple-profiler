@@ -860,6 +860,9 @@ _COUNTER_GROUPS: dict[str, int] = {
     "TextureFilteringLimiter": 3,
     # Compression — MEMORY
     "CompressionRatioTextureMemoryRead": 5,
+    # GPU core configuration — SYSTEM
+    "Active Cores": 1,
+    "Total Cores": 1,
 }
 
 

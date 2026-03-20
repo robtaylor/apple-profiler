@@ -985,6 +985,21 @@ def read_gputrace_counters(
         for s in range(num_samples):
             samples[s].append(values[s])
 
+    # Extract Active Cores / Total Cores from costTimeline (constant values)
+    cost_tl = mio.costTimeline()
+    if cost_tl is not None:
+        sampled_cores = int(cost_tl.sampledCores())
+        total_cores = int(cost_tl.totalCores())
+        if sampled_cores > 0:
+            counter_names.append("Active Cores")
+            for s in range(num_samples):
+                samples[s].append(float(sampled_cores))
+            log.info("Active Cores: %d (of %d total)", sampled_cores, total_cores)
+        if total_cores > 0:
+            counter_names.append("Total Cores")
+            for s in range(num_samples):
+                samples[s].append(float(total_cores))
+
     log.info(
         "Extracted %d counters x %d samples from MIO timeline",
         len(counter_names), num_samples,
