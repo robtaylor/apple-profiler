@@ -23,8 +23,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/roberte3/apple-profiler"
-Repository = "https://github.com/roberte3/apple-profiler"
+Homepage = "https://github.com/robtaylor/apple-profiler"
+Repository = "https://github.com/robtaylor/apple-profiler"
 
 [project.scripts]
 apple-profiler = "apple_profiler.mcp_server:main"
