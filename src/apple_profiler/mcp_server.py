@@ -574,7 +574,7 @@ async def profiler_list_tables(params: TracePathInput) -> str:
 # These delegate to tools/*.py as subprocesses with DYLD_FRAMEWORK_PATH set,
 # since those scripts require Apple private GPU frameworks loaded at startup.
 
-_TOOLS_DIR = Path(__file__).resolve().parent.parent.parent / "tools"
+_TOOLS_DIR = Path(__file__).resolve().parent / "tools"
 _DYLD_FW = "/Applications/Xcode.app/Contents/SharedFrameworks"
 
 # Cache for parsed GPU trace data (avoids re-running subprocess)

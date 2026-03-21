@@ -1,11 +1,30 @@
 [project]
 name = "apple-profiler"
 version = "0.2.0"
-description = "Python wrapper for xctrace export XML parsing"
+description = "MCP server for CPU and GPU performance profiling on Apple platforms"
 requires-python = ">=3.10"
+readme = "README.md"
+license = "MIT"
+authors = [
+    {name = "Robert Taylor"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: MacOS",
+    "Topic :: Software Development :: Debuggers",
+]
 dependencies = [
     "mcp[cli]>=1.26.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/roberte3/apple-profiler"
+Repository = "https://github.com/roberte3/apple-profiler"
 
 [project.scripts]
 apple-profiler = "apple_profiler.mcp_server:main"
