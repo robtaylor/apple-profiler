@@ -25,6 +25,7 @@ See memory/gputrace-format.md for detailed format documentation.
 """
 from __future__ import annotations
 
+import argparse
 import ctypes
 import glob as globmod
 import json
@@ -1203,14 +1204,8 @@ def read_gputrace_counters(
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    _ensure_dyld_framework_path()
-    path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/baspacho_ffi.gputrace"
-    result = read_gputrace(path)
-
-    if result is None:
-        sys.exit(1)
-
+def _print_human_readable(path: str, result: dict[str, Any]) -> None:
+    """Print human-readable timeline summary to stdout."""
     print(f"=== GPU Trace Timeline: {path} ===")
     print(f"Total Metal API calls: {result['total_functions']}")
     print(f"Metadata: {result['metadata']}")
@@ -1267,6 +1262,49 @@ def main() -> None:
             cb_kernels[d["kernel"]] += 1
         for k, c in sorted(cb_kernels.items(), key=lambda x: -x[1]):
             print(f"    {k}: {c}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Extract timeline and resource usage from a .gputrace file.",
+    )
+    parser.add_argument(
+        "trace_path",
+        nargs="?",
+        default="/tmp/baspacho_ffi.gputrace",
+        help="Path to .gputrace file",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output read_gputrace() result as JSON to stdout",
+    )
+    parser.add_argument(
+        "--counters-json",
+        action="store_true",
+        help="Output read_gputrace_counters() result as JSON to stdout",
+    )
+    args = parser.parse_args()
+
+    _ensure_dyld_framework_path()
+
+    if args.counters_json:
+        counters = read_gputrace_counters(args.trace_path)
+        if counters is None:
+            log.error("No counter data found")
+            sys.exit(1)
+        json.dump(counters, sys.stdout)
+        sys.exit(0)
+
+    result = read_gputrace(args.trace_path)
+    if result is None:
+        sys.exit(1)
+
+    if args.json:
+        json.dump(result, sys.stdout)
+        sys.exit(0)
+
+    _print_human_readable(args.trace_path, result)
 
 
 if __name__ == "__main__":

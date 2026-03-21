@@ -3,14 +3,22 @@
 Provides tools for opening .trace files, inspecting metadata, querying
 CPU samples, hangs, signpost events/intervals, and computing top functions.
 
+Also provides GPU trace analysis tools that delegate to tools/*.py scripts
+via subprocess (since they require DYLD_FRAMEWORK_PATH for Apple private
+GPU frameworks).
+
 Usage:
     uv run python -m apple_profiler.mcp_server
 """
 
 from __future__ import annotations
 
+import asyncio
+import fnmatch
 import json
 import logging
+import os
+import sys
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -560,6 +568,464 @@ async def profiler_list_tables(params: TracePathInput) -> str:
         )
     except Exception as e:
         return f"Error listing tables: {e}"
+
+
+# ── GPU Trace Tools ──
+# These delegate to tools/*.py as subprocesses with DYLD_FRAMEWORK_PATH set,
+# since those scripts require Apple private GPU frameworks loaded at startup.
+
+_TOOLS_DIR = Path(__file__).resolve().parent.parent.parent / "tools"
+_DYLD_FW = "/Applications/Xcode.app/Contents/SharedFrameworks"
+
+# Cache for parsed GPU trace data (avoids re-running subprocess)
+_gpu_trace_cache: dict[str, dict] = {}
+_gpu_counter_cache: dict[str, dict] = {}
+
+
+async def _run_gpu_tool(
+    script: str,
+    args: list[str],
+    *,
+    timeout: int = 120,
+    cache_key: str | None = None,
+    cache_store: dict[str, dict] | None = None,
+) -> dict:
+    """Run a tools/*.py script with DYLD_FRAMEWORK_PATH, return parsed JSON.
+
+    Args:
+        script: Script filename in tools/ directory.
+        args: CLI arguments (trace path, flags, etc.). --json is appended.
+        timeout: Subprocess timeout in seconds.
+        cache_key: If set, check/store result in cache_store.
+        cache_store: Dict to use for caching (e.g., _gpu_trace_cache).
+
+    Returns:
+        Parsed JSON dict from subprocess stdout.
+
+    Raises:
+        FileNotFoundError: If script doesn't exist.
+        RuntimeError: If subprocess fails or returns invalid JSON.
+        TimeoutError: If subprocess exceeds timeout.
+    """
+    if cache_key and cache_store is not None and cache_key in cache_store:
+        return cache_store[cache_key]
+
+    script_path = _TOOLS_DIR / script
+    if not script_path.exists():
+        raise FileNotFoundError(f"GPU tool script not found: {script_path}")
+
+    env = {**os.environ, "DYLD_FRAMEWORK_PATH": _DYLD_FW}
+    cmd = [sys.executable, str(script_path), *args]
+    if "--json" not in args and "--counters-json" not in args:
+        cmd.append("--json")
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise TimeoutError(
+            f"{script} timed out after {timeout}s"
+        ) from None
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"{script} failed (rc={proc.returncode}): {stderr.decode()}")
+
+    try:
+        result = json.loads(stdout.decode())
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"{script} returned invalid JSON: {e}\nstdout: {stdout.decode()[:500]}"
+        ) from e
+
+    if cache_key and cache_store is not None:
+        cache_store[cache_key] = result
+
+    return result
+
+
+# ── GPU Input Models ──
+
+
+class GpuTracePathInput(BaseModel):
+    """Input requiring a .gputrace file path."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+    gputrace_path: str = Field(
+        ..., description="Path to .gputrace file", min_length=1,
+    )
+
+
+class GpuTimelineInput(BaseModel):
+    """Input for GPU timeline queries with filtering."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+    gputrace_path: str = Field(
+        ..., description="Path to .gputrace file", min_length=1,
+    )
+    kernel_filter: str | None = Field(
+        None, description="Glob pattern to filter by kernel name (e.g., 'lu_factor*')",
+    )
+    cb_filter: int | None = Field(
+        None, description="Filter to specific command buffer index",
+    )
+    encoder_filter: int | None = Field(
+        None, description="Filter to specific encoder index",
+    )
+    limit: int | None = Field(
+        None, description="Max events to return", ge=1,
+    )
+    offset: int = Field(
+        0, description="Skip first N events", ge=0,
+    )
+
+
+class GpuDepsInput(BaseModel):
+    """Input for GPU dependency graph analysis."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+    gputrace_path: str = Field(
+        ..., description="Path to .gputrace file", min_length=1,
+    )
+    scale: str = Field(
+        "encoder",
+        description="Graph scale: dispatch, encoder, kernel, or cb",
+    )
+    kernel_filter: str | None = Field(
+        None, description="Glob pattern to filter kernels",
+    )
+    cb_filter: int | None = Field(
+        None, description="Filter to command buffer index",
+    )
+    encoder_filter: int | None = Field(
+        None, description="Filter to encoder index",
+    )
+
+
+class GpuCountersInput(BaseModel):
+    """Input for GPU performance counter queries."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+    gputrace_path: str = Field(
+        ..., description="Path to .gputrace file", min_length=1,
+    )
+    counter_filter: list[str] | None = Field(
+        None, description="Specific counter names to return (default: all)",
+    )
+    summary: bool = Field(
+        True,
+        description="Return summary stats (min/max/avg) instead of full time-series",
+    )
+
+
+class GpuExportInput(BaseModel):
+    """Input for GPU trace Perfetto export."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+    gputrace_path: str = Field(
+        ..., description="Path to .gputrace file", min_length=1,
+    )
+    output_path: str | None = Field(
+        None, description="Output .pftrace path (default: auto-generated)",
+    )
+    group_by: str = Field(
+        "pipeline",
+        description="Track grouping: 'pipeline' groups by kernel name, "
+                    "'cb' groups by command buffer/encoder",
+    )
+    include_counters: bool = Field(
+        True, description="Include GPU performance counter tracks",
+    )
+
+
+# ── GPU Tools ──
+
+
+@mcp.tool(
+    name="profiler_gpu_open",
+    annotations=ToolAnnotations(
+        title="Open GPU Trace",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def profiler_gpu_open(params: GpuTracePathInput) -> str:
+    """Open a .gputrace and return structural overview.
+
+    Returns metadata, kernel list, command buffer/encoder structure,
+    and dispatch counts. Use this first to understand the GPU workload
+    before diving into dependencies or counters.
+    """
+    try:
+        resolved = str(Path(params.gputrace_path).resolve())
+        data = await _run_gpu_tool(
+            "gputrace_timeline.py",
+            [params.gputrace_path],
+            cache_key=resolved,
+            cache_store=_gpu_trace_cache,
+        )
+        return json.dumps(
+            {
+                "metadata": data["metadata"],
+                "total_functions": data["total_functions"],
+                "kernels": data["kernels"],
+                "pipelines": data.get("pipelines", {}),
+                "num_dispatches": len(
+                    [e for e in data["events"] if e["type"] == "dispatch"]
+                ),
+                "num_barriers": len(
+                    [e for e in data["events"] if e["type"] == "barrier"]
+                ),
+                "command_buffers": [
+                    {
+                        "index": i,
+                        "addr": cb.get("addr", ""),
+                        "num_dispatches": len(cb["dispatches"]),
+                    }
+                    for i, cb in enumerate(data["command_buffers"])
+                ],
+                "compute_encoders": [
+                    {
+                        "encoder_idx": enc["encoder_idx"],
+                        "cb_idx": enc["command_buffer_idx"],
+                        "num_dispatches": len(enc["dispatches"]),
+                    }
+                    for enc in data["compute_encoders"]
+                ],
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return f"Error opening GPU trace: {e}"
+
+
+@mcp.tool(
+    name="profiler_gpu_timeline",
+    annotations=ToolAnnotations(
+        title="GPU Timeline Events",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def profiler_gpu_timeline(params: GpuTimelineInput) -> str:
+    """Get detailed Metal API timeline events from a .gputrace.
+
+    Returns dispatch events with kernel names, threadgroup sizes,
+    buffer bindings, and barrier events. Use filters to scope to
+    specific command buffers, encoders, or kernel patterns.
+    """
+    try:
+        resolved = str(Path(params.gputrace_path).resolve())
+        data = await _run_gpu_tool(
+            "gputrace_timeline.py",
+            [params.gputrace_path],
+            cache_key=resolved,
+            cache_store=_gpu_trace_cache,
+        )
+        events = data["events"]
+
+        # Apply filters
+        if params.cb_filter is not None:
+            # Get dispatch indices from the target command buffer
+            if params.cb_filter < len(data["command_buffers"]):
+                cb = data["command_buffers"][params.cb_filter]
+                cb_indices = {d["index"] for d in cb["dispatches"]}
+                events = [
+                    e for e in events
+                    if e["type"] != "dispatch" or e.get("index") in cb_indices
+                ]
+            else:
+                events = []
+
+        if params.encoder_filter is not None:
+            # Get dispatch indices from the target encoder
+            matching_encs = [
+                enc for enc in data["compute_encoders"]
+                if enc["encoder_idx"] == params.encoder_filter
+            ]
+            if matching_encs:
+                enc_indices = set()
+                for enc in matching_encs:
+                    enc_indices.update(d["index"] for d in enc["dispatches"])
+                events = [
+                    e for e in events
+                    if e["type"] != "dispatch" or e.get("index") in enc_indices
+                ]
+            else:
+                events = []
+
+        if params.kernel_filter:
+            events = [
+                e for e in events
+                if e["type"] != "dispatch"
+                or fnmatch.fnmatch(e.get("kernel", ""), params.kernel_filter)
+            ]
+
+        total = len(events)
+
+        # Apply offset/limit
+        if params.offset > 0:
+            events = events[params.offset:]
+        if params.limit is not None:
+            events = events[: params.limit]
+
+        return json.dumps(
+            {"total": total, "returned": len(events), "events": events},
+            indent=2,
+        )
+    except Exception as e:
+        return f"Error reading GPU timeline: {e}"
+
+
+@mcp.tool(
+    name="profiler_gpu_dependencies",
+    annotations=ToolAnnotations(
+        title="GPU Dependency Graph",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def profiler_gpu_dependencies(params: GpuDepsInput) -> str:
+    """Analyze buffer dependencies between GPU dispatches.
+
+    Returns dependency DAG with critical path length, parallelism
+    metrics, per-kernel edge counts, and buffer hazard details.
+    Use scale parameter to view at dispatch, encoder, kernel, or
+    command buffer granularity.
+    """
+    try:
+        args = [params.gputrace_path, "--scale", params.scale]
+        if params.kernel_filter:
+            args += ["--filter-kernel", params.kernel_filter]
+        if params.cb_filter is not None:
+            args += ["--filter-cb", str(params.cb_filter)]
+        if params.encoder_filter is not None:
+            args += ["--filter-encoder", str(params.encoder_filter)]
+        data = await _run_gpu_tool("gputrace_depgraph.py", args)
+        return json.dumps(data, indent=2)
+    except Exception as e:
+        return f"Error analyzing GPU dependencies: {e}"
+
+
+@mcp.tool(
+    name="profiler_gpu_counters",
+    annotations=ToolAnnotations(
+        title="GPU Performance Counters",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def profiler_gpu_counters(params: GpuCountersInput) -> str:
+    """Get GPU performance counter data from shader profiling.
+
+    Returns counter values from the MIO pipeline — occupancy, memory
+    bandwidth, instruction throughput, cache hit rates, etc. Requires
+    streamData from Xcode shader profiling (Replay with Profile enabled).
+
+    Use summary=true (default) for quick stats per counter, or
+    summary=false for full time-series data.
+    """
+    try:
+        resolved = str(Path(params.gputrace_path).resolve())
+        data = await _run_gpu_tool(
+            "gputrace_timeline.py",
+            [params.gputrace_path, "--counters-json"],
+            cache_key=resolved,
+            cache_store=_gpu_counter_cache,
+        )
+
+        counter_names = data["counter_names"]
+        num_samples = data["num_samples"]
+        samples = data["samples"]
+
+        # Filter to requested counters
+        if params.counter_filter:
+            indices = [
+                i for i, name in enumerate(counter_names)
+                if name in params.counter_filter
+            ]
+            counter_names = [counter_names[i] for i in indices]
+            samples = [[row[i] for i in indices] for row in samples]
+        else:
+            indices = list(range(len(counter_names)))
+
+        if params.summary:
+            # Compute min/max/avg for each counter
+            result_counters = []
+            for j, name in enumerate(counter_names):
+                values = [samples[s][j] for s in range(num_samples)]
+                result_counters.append({
+                    "name": name,
+                    "min": min(values),
+                    "max": max(values),
+                    "avg": sum(values) / len(values) if values else 0,
+                    "num_samples": len(values),
+                })
+            return json.dumps(
+                {"total_counters": len(result_counters), "counters": result_counters},
+                indent=2,
+            )
+        else:
+            return json.dumps(
+                {
+                    "counter_names": counter_names,
+                    "num_samples": num_samples,
+                    "timestamps_ns": data["timestamps_ns"],
+                    "samples": samples,
+                },
+                indent=2,
+            )
+    except Exception as e:
+        return f"Error reading GPU counters: {e}"
+
+
+@mcp.tool(
+    name="profiler_gpu_export_perfetto",
+    annotations=ToolAnnotations(
+        title="Export GPU Trace to Perfetto",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def profiler_gpu_export_perfetto(params: GpuExportInput) -> str:
+    """Export GPU trace to Perfetto .pftrace format for visualization.
+
+    Creates a .pftrace file viewable at ui.perfetto.dev with GPU dispatch
+    timeline, barrier events, and optionally performance counter tracks.
+    """
+    try:
+        args = [params.gputrace_path, "--format", "pftrace",
+                "--group-by", params.group_by]
+        if params.include_counters:
+            args.append("--counters")
+        if params.output_path:
+            args += ["-o", params.output_path]
+        data = await _run_gpu_tool(
+            "gputrace_perfetto.py", args, timeout=180,
+        )
+        return json.dumps(
+            {"output_path": data["output_path"], "size_bytes": data["size"]},
+            indent=2,
+        )
+    except Exception as e:
+        return f"Error exporting GPU trace: {e}"
 
 
 def main() -> None:

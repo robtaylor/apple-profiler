@@ -24,6 +24,7 @@ dev = [
     "pyright>=1.1",
     "pytest-timeout>=2.4.0",
     "perfetto>=0.7",
+    "pytest-asyncio>=1.3.0",
 ]
 
 [tool.ruff]

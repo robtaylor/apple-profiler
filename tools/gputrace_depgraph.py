@@ -1955,6 +1955,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Auto-open the output file in browser (most useful with -f html)",
     )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Output dependency graph as JSON to stdout (for MCP integration)",
+    )
     return p.parse_args()
 
 
@@ -2064,6 +2069,18 @@ def main() -> None:
     if not args.no_reduce and graph.edges:
         graph = transitive_reduction(graph)
         log.info("After reduction: %d edges", len(graph.edges))
+
+    # JSON to stdout for MCP integration
+    if args.json:
+        json_data = format_json(graph)
+        json_data["scale"] = args.scale
+        json_data["metadata"] = {
+            "num_command_buffers": meta.num_cbs,
+            "num_encoders": meta.num_encoders,
+            "num_barriers": len(barriers),
+        }
+        json.dump(json_data, sys.stdout)
+        return
 
     # Summary
     print_summary(graph, meta.num_cbs, num_barriers=len(barriers))

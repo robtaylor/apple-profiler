@@ -1129,6 +1129,10 @@ def main() -> None:
         "--open", action="store_true",
         help="Open ui.perfetto.dev in browser after export",
     )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Output export metadata as JSON to stdout (for MCP integration)",
+    )
     args = parser.parse_args()
 
     import os
@@ -1190,13 +1194,22 @@ def main() -> None:
         )
         with open(output_path, "wb") as f:
             f.write(trace_bytes)
-        log.info("Wrote %d bytes to %s", len(trace_bytes), output_path)
+        output_size = len(trace_bytes)
+        log.info("Wrote %d bytes to %s", output_size, output_path)
     else:
         perfetto = timeline_to_perfetto(trace_data, group_by=args.group_by)
         with open(output_path, "w") as f:
             json.dump(perfetto, f, indent=2)
+        output_size = os.path.getsize(output_path)
         num_events = len(perfetto["traceEvents"])
         log.info("Wrote %d events to %s", num_events, output_path)
+
+    if args.json:
+        json.dump({
+            "output_path": str(Path(output_path).resolve()),
+            "size": output_size,
+        }, sys.stdout)
+        return
 
     log.info("Open https://ui.perfetto.dev and drag in the file to view.")
 
