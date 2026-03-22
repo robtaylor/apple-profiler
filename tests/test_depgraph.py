@@ -7,13 +7,9 @@ Apple frameworks or .gputrace files.
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
 
-# Add tools dir to import the module
-sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
-
-from gputrace_depgraph import (  # noqa: I001
+# Import from the package tools module
+from apple_profiler.tools.gputrace_depgraph import (  # noqa: I001
     AccessMode,
     AggregatedGraph,
     BarrierNode,

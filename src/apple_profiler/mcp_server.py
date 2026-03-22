@@ -258,6 +258,7 @@ async def profiler_open_trace(params: TracePathInput) -> str:
             indent=2,
         )
     except Exception as e:
+        logger.exception("Error opening trace: %s", params.trace_path)
         return f"Error opening trace: {e}"
 
 
@@ -303,6 +304,7 @@ async def profiler_cpu_samples(params: CpuSamplesInput) -> str:
             indent=2,
         )
     except Exception as e:
+        logger.exception("Error reading CPU samples: %s", params.trace_path)
         return f"Error reading CPU samples: {e}"
 
 
@@ -345,6 +347,7 @@ async def profiler_top_functions(params: TopFunctionsInput) -> str:
             indent=2,
         )
     except Exception as e:
+        logger.exception("Error computing top functions: %s", params.trace_path)
         return f"Error computing top functions: {e}"
 
 
@@ -380,6 +383,7 @@ async def profiler_hangs(params: TracePathInput) -> str:
             indent=2,
         )
     except Exception as e:
+        logger.exception("Error reading hangs: %s", params.trace_path)
         return f"Error reading hangs: {e}"
 
 
@@ -423,6 +427,7 @@ async def profiler_signpost_events(params: SignpostFilterInput) -> str:
             indent=2,
         )
     except Exception as e:
+        logger.exception("Error reading signpost events: %s", params.trace_path)
         return f"Error reading signpost events: {e}"
 
 
@@ -466,6 +471,7 @@ async def profiler_signpost_intervals(params: SignpostFilterInput) -> str:
             indent=2,
         )
     except Exception as e:
+        logger.exception("Error reading signpost intervals: %s", params.trace_path)
         return f"Error reading signpost intervals: {e}"
 
 
@@ -504,7 +510,7 @@ async def profiler_query_table(params: TableQueryInput) -> str:
                 },
                 indent=2,
             )
-        table = t._load_table(params.schema)
+        table = t.load_table(params.schema)
         col_index = {col.mnemonic: i for i, col in enumerate(table.columns)}
 
         rows = table.rows
@@ -534,6 +540,7 @@ async def profiler_query_table(params: TableQueryInput) -> str:
             indent=2,
         )
     except Exception as e:
+        logger.exception("Error querying table '%s': %s", params.schema, params.trace_path)
         return f"Error querying table '{params.schema}': {e}"
 
 
@@ -567,6 +574,7 @@ async def profiler_list_tables(params: TracePathInput) -> str:
             indent=2,
         )
     except Exception as e:
+        logger.exception("Error listing tables: %s", params.trace_path)
         return f"Error listing tables: {e}"
 
 
@@ -805,6 +813,7 @@ async def profiler_gpu_open(params: GpuTracePathInput) -> str:
             indent=2,
         )
     except Exception as e:
+        logger.exception("Error opening GPU trace: %s", params.gputrace_path)
         return f"Error opening GPU trace: {e}"
 
 
@@ -885,6 +894,7 @@ async def profiler_gpu_timeline(params: GpuTimelineInput) -> str:
             indent=2,
         )
     except Exception as e:
+        logger.exception("Error reading GPU timeline: %s", params.gputrace_path)
         return f"Error reading GPU timeline: {e}"
 
 
@@ -917,6 +927,7 @@ async def profiler_gpu_dependencies(params: GpuDepsInput) -> str:
         data = await _run_gpu_tool("gputrace_depgraph.py", args)
         return json.dumps(data, indent=2)
     except Exception as e:
+        logger.exception("Error analyzing GPU dependencies: %s", params.gputrace_path)
         return f"Error analyzing GPU dependencies: {e}"
 
 
@@ -991,6 +1002,7 @@ async def profiler_gpu_counters(params: GpuCountersInput) -> str:
                 indent=2,
             )
     except Exception as e:
+        logger.exception("Error reading GPU counters: %s", params.gputrace_path)
         return f"Error reading GPU counters: {e}"
 
 
@@ -1025,6 +1037,7 @@ async def profiler_gpu_export_perfetto(params: GpuExportInput) -> str:
             indent=2,
         )
     except Exception as e:
+        logger.exception("Error exporting GPU trace: %s", params.gputrace_path)
         return f"Error exporting GPU trace: {e}"
 
 

@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any
 
 import objc  # type: ignore[import-untyped]
-from Foundation import NSURL, NSBundle  # type: ignore[import-untyped]
+from Foundation import NSURL  # type: ignore[import-untyped]
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -53,43 +53,12 @@ warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
 # Apple private framework loading
 # ---------------------------------------------------------------------------
 
-SHARED_FW = "/Applications/Xcode.app/Contents/SharedFrameworks"
-_FRAMEWORK_NAMES = [
-    "GPUToolsCore",
-    "GPUTools",
-    "GPUToolsPlatform",
-    "GLToolsCore",
-    "GPUToolsServices",
-]
+try:
+    from ._frameworks import SHARED_FW, ensure_dyld_framework_path, load_frameworks
+except ImportError:
+    from _frameworks import SHARED_FW, ensure_dyld_framework_path, load_frameworks  # type: ignore[no-redef]
 
-
-def _ensure_dyld_framework_path() -> None:
-    """Re-exec with DYLD_FRAMEWORK_PATH if not set.
-
-    dyld reads this variable at process startup to resolve @rpath references,
-    so it must be set before any GPU framework is loaded. When missing, we
-    set it and os.execv() to restart the process.
-    """
-    if os.environ.get("DYLD_FRAMEWORK_PATH") != SHARED_FW:
-        os.environ["DYLD_FRAMEWORK_PATH"] = SHARED_FW
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
-
-def _load_frameworks() -> None:
-    """Load Apple private GPU frameworks in dependency order."""
-    for name in _FRAMEWORK_NAMES:
-        bundle = NSBundle.bundleWithPath_(f"{SHARED_FW}/{name}.framework")
-        if bundle is not None:
-            bundle.load()
-    # System private framework
-    sys_bundle = NSBundle.bundleWithPath_(
-        "/System/Library/PrivateFrameworks/GPUToolsCapture.framework"
-    )
-    if sys_bundle is not None:
-        sys_bundle.load()
-
-
-_load_frameworks()
+load_frameworks()
 
 DYCaptureArchive = objc.lookUpClass("DYCaptureArchive")
 DYFunctionTracer = objc.lookUpClass("DYFunctionTracer")
@@ -799,156 +768,16 @@ def _extract_mio_counter(
 
 
 # Counter display order: most useful categories first, then alphabetical
-# within each category. Tuple is (priority, name) for stable sorting.
-_COUNTER_CATEGORY_ORDER: list[tuple[int, list[str]]] = [
-    # 0: GPU activity & cores
-    (0, [
-        "GT Active Core Count",
-        "Raytracing Active GT",
-    ]),
-    # 1: Occupancy
-    (1, [
-        "Total Occupancy",
-        "Compute Occupancy",
-        "Fragment Occupancy",
-        "Vertex Occupancy",
-        "Occupancy Manager Target",
-        "Total Simdgroups Inflight Per Shader Core",
-        "Compute Simdgroups Inflight Per Shader Core",
-        "Fragment Simdgroups Inflight Per Shader Core",
-        "Vertex Simdgroups Inflight Per Shader Core",
-        "Occupancy Management L1 Eviction Rate",
-    ]),
-    # 2: Memory bandwidth
-    (2, [
-        "AF Bandwidth",
-        "AF Read Bandwidth",
-        "AF Write Bandwidth",
-        "AF Peak Bandwidth",
-        "AF Peak Read Bandwidth",
-        "AF Peak Write Bandwidth",
-        "L2 Bandwidth",
-    ]),
-    # 3: Shader core utilization & instruction throughput
-    (3, [
-        "Shader Core Utilization",
-        "Shader Core Limiter",
-        "ALU Utilization",
-        "F16 Utilization",
-        "F16 Limiter",
-        "F32 Utilization",
-        "F32 Limiter",
-        "IC Utilization",
-        "IC Limiter",
-        "SCIB Utilization",
-        "SCIB Limiter",
-        "Control Flow Utilization",
-        "Control Flow Limiter",
-        "Instruction Dispatch Utilization",
-        "Instruction Dispatch Limiter",
-        "Instruction Issue Utilization",
-        "Instruction Issue Limiter",
-        "Address Generation Utilization",
-        "Address Generation Limiter",
-    ]),
-    # 4: Shader launch
-    (4, [
-        "Compute Shader Launch Utilization",
-        "Compute Shader Launch Limiter",
-        "Fragment Shader Launch Utilization",
-        "Fragment Shader Launch Limiter",
-        "Vertex Shader Launch Utilization",
-        "Vertex Shader Launch Limiter",
-    ]),
-    # 5: L1 cache bandwidth
-    (5, [
-        "L1 Load Bandwidth",
-        "L1 Store Bandwidth",
-        "L1 Cache Utilization",
-        "L1 Cache Limiter",
-        "Buffer L1 Load Bandwidth",
-        "Buffer L1 Store Bandwidth",
-        "Buffer L1 Load Ratio",
-        "Buffer L1 Store Ratio",
-        "Buffer L1 Miss Rate",
-        "Imageblock L1 Load Bandwidth",
-        "Imageblock L1 Store Bandwidth",
-        "Imageblock L1 Load Ratio",
-        "Imageblock L1 Store Ratio",
-        "Threadgroup Memory L1 Load Bandwidth",
-        "Threadgroup Memory L1 Store Bandwidth",
-        "Threadgroup L1 Load Ratio",
-        "Threadgroup L1 Store Ratio",
-        "Stack L1 Load Bandwidth",
-        "Stack L1 Store Bandwidth",
-        "Stack L1 Load Ratio",
-        "Stack L1 Store Ratio",
-        "GPR L1 Load Bandwidth",
-        "GPR L1 Store Bandwidth",
-        "GPR L1 Read Ratio",
-        "GPR L1 Write Ratio",
-        "Other L1 Load Bandwidth",
-        "Other L1 Store Bandwidth",
-        "Other L1 Loads Ratio",
-        "Other L1 Stores Ratio",
-    ]),
-    # 6: L1 residency / bytes occupancy
-    (6, [
-        "L1 Total Occupancy",
-        "L1 Total Bytes Occupancy",
-        "L1 Buffer Occupancy",
-        "L1 Buffer Bytes Occupancy",
-        "L1 Imageblock Occupancy",
-        "L1 Imageblock Bytes Occupancy",
-        "L1 Threadgroup Occupancy",
-        "L1 Threadgroup Bytes Occupancy",
-        "L1 GPR Occupancy",
-        "L1 GPR Bytes Occupancy",
-        "L1 Stack Occupancy",
-        "L1 Stack Bytes Occupancy",
-        "L1 Other Occupancy",
-        "L1 Other Bytes Occupancy",
-        "L1 Raytracing Scratch Occupancy",
-        "L1 Raytracing Scratch Bytes Occupancy",
-    ]),
-    # 7: L2 / texture / MMU
-    (7, [
-        "L2 Cache Utilization",
-        "L2 Cache Limiter",
-        "Texture Cache Utilization",
-        "Texture Cache Limiter",
-        "Texture Read Utilization",
-        "Texture Read Limiter",
-        "Texture Write Utilization",
-        "Texture Write Limiter",
-        "TextureFilteringLimiter",
-        "CompressionRatioTextureMemoryRead",
-        "MMU Utilization",
-        "MMU Limiter",
-    ]),
-    # 8: Raytracing
-    (8, [
-        "Raytracing Active",
-        "Ray Occupancy",
-        "Leaf Test Occupancy",
-        "Ray T Leaf Test",
-        "Raytracing Node Test",
-        "Intersect Ray Threads",
-        "Raytracing Scratch L1 Load Bandwidth",
-        "Raytracing Scratch L1 Store Bandwidth",
-        "Raytracing Scratch L1 Load Ratio",
-        "Raytracing Scratch L1 Store Ratio",
-    ]),
-]
+# within each category. Single source of truth in _gpu_counters.py.
+try:
+    from ._gpu_counters import build_sort_map
+except ImportError:
+    from _gpu_counters import build_sort_map  # type: ignore[no-redef]
 
-# Build lookup: counter name → (category_priority, index_within_category)
-_COUNTER_SORT_MAP: dict[str, tuple[int, int]] = {}
-for _cat_prio, _names in _COUNTER_CATEGORY_ORDER:
-    for _idx, _name in enumerate(_names):
-        _COUNTER_SORT_MAP[_name] = (_cat_prio, _idx)
+_COUNTER_SORT_MAP: dict[str, tuple[int, int]] = build_sort_map()
 
 # Unlisted named counters go after all listed ones, sorted alphabetically
-_UNLISTED_CATEGORY = len(_COUNTER_CATEGORY_ORDER)
+_UNLISTED_CATEGORY = max(v[0] for v in _COUNTER_SORT_MAP.values()) + 1 if _COUNTER_SORT_MAP else 0
 
 
 def _counter_sort_key(name: str) -> tuple[int, int, str]:
@@ -959,30 +788,17 @@ def _counter_sort_key(name: str) -> tuple[int, int, str]:
     return (_UNLISTED_CATEGORY, 0, name)
 
 
-def read_gputrace_counters(
+def _load_mio_timeline(
     gputrace_path: str,
     *,
     replay: bool = False,
     replay_timeout: int = 120,
-) -> dict[str, Any] | None:
-    """Extract derived GPU performance counter samples from streamData.
+) -> tuple[Any, Any, Any, str | None] | None:
+    """Load and process streamData into MIO timeline objects.
 
-    Uses GTShaderProfilerStreamDataProcessor → mioData() → overlapping
-    timeline → counterForName: to extract per-counter time-series data.
+    Shared helper used by both counter extraction and timestamp extraction.
 
-    Searches for streamData in the gputrace bundle and Xcode's temp
-    profiling directory. If not found and replay=True, opens the
-    gputrace in Xcode and clicks Replay to trigger shader profiling.
-
-    Requires GTShaderProfiler.framework (loaded from GPUDebugger.ideplugin).
-    Returns None if streamData is missing or frameworks unavailable.
-
-    Returns a dict with keys:
-      counter_names  - list of counter name strings
-      num_samples    - number of periodic samples
-      timestamps_ns  - list of uint64 timestamps (MIO timeline ticks)
-      samples        - list of lists: samples[i][j] = float64 value for
-                       sample i, counter j
+    Returns (processor, mio, timeline, stream_path) or None on failure.
     """
     stream_path = _find_stream_data(gputrace_path)
 
@@ -1094,6 +910,173 @@ def read_gputrace_counters(
     if timeline is None:
         log.warning("No nonOverlappingTimeline in MIO data")
         return None
+
+    return processor, mio, timeline, stream_path
+
+
+def read_gputrace_timestamps(
+    gputrace_path: str,
+    *,
+    event_data: dict[str, Any] | None = None,
+    replay: bool = False,
+    replay_timeout: int = 120,
+) -> dict[str, Any] | None:
+    """Extract real GPU nanosecond timestamps for each dispatch.
+
+    Uses GTShaderProfilerStreamDataProcessor -> mioData() -> nonOverlappingTimeline()
+    to read per-dispatch GPU execution timestamps from the drawTraces and draws
+    arrays.
+
+    Args:
+        gputrace_path: Path to the .gputrace bundle.
+        event_data: Optional output from read_gputrace(). When provided, the
+            returned timestamps dict is keyed by the event stream's func_idx
+            values (matching dispatch order). When None, the timestamps dict
+            is keyed by the MIO draw metadata's func_idx values.
+        replay: If True and streamData is missing, trigger Xcode replay.
+        replay_timeout: Timeout for Xcode replay in seconds.
+
+    Returns a dict with keys:
+      timestamps      - dict mapping func_idx (int) -> (ts_begin_ns, ts_end_ns)
+      timeline_end_ns - total GPU timeline duration in nanoseconds
+      gpu_time_ns     - active GPU execution time in nanoseconds
+      draw_count      - number of dispatches with timestamps
+
+    Returns None if streamData is missing or MIO pipeline fails.
+    """
+    loaded = _load_mio_timeline(
+        gputrace_path, replay=replay, replay_timeout=replay_timeout,
+    )
+    if loaded is None:
+        return None
+
+    processor, mio, timeline, stream_path = loaded
+
+    draw_count = timeline.drawCount()
+    dt_count = timeline.drawTraceCount()
+    if draw_count == 0 or dt_count == 0:
+        log.info("No draws in MIO timeline (draw_count=%d, drawTraceCount=%d)",
+                 draw_count, dt_count)
+        return None
+
+    # Access raw C arrays via objc_msgSend (pyobjc can't bridge raw pointers)
+    libobjc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.dylib")
+    sel_registerName = libobjc.sel_registerName
+    sel_registerName.restype = ctypes.c_void_p
+    sel_registerName.argtypes = [ctypes.c_char_p]
+    objc_msgSend_ptr = ctypes.CFUNCTYPE(
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    )(("objc_msgSend", libobjc))
+    tl_ptr = objc.pyobjc_id(timeline)
+
+    # Read drawTraces: packed array of {uint64 tsBegin, uint64 tsEnd, uint32 idx, uint16 type}
+    # Stride = 22 bytes (no alignment padding)
+    _DRAW_TRACE_STRIDE = 22
+    sel_dt = sel_registerName(b"drawTraces")
+    dt_ptr = objc_msgSend_ptr(tl_ptr, sel_dt)
+    if not dt_ptr:
+        log.warning("drawTraces returned NULL")
+        return None
+    raw_dt = ctypes.string_at(dt_ptr, dt_count * _DRAW_TRACE_STRIDE)
+
+    ts_end_timeline = timeline.timestampEnd()
+
+    # Build ordered list of (ts_begin, ts_end) for each draw by sequential index
+    draw_timestamps: list[tuple[int, int]] = []
+    n_draws = min(draw_count, dt_count)
+
+    for i in range(n_draws):
+        # Draw trace: tsBegin(Q) at +0, tsEnd(Q) at +8
+        dt_off = i * _DRAW_TRACE_STRIDE
+        ts_begin = struct.unpack_from("<Q", raw_dt, dt_off)[0]
+        ts_end = struct.unpack_from("<Q", raw_dt, dt_off + 8)[0]
+
+        # Validate timestamp range
+        if ts_begin <= ts_end_timeline and ts_end <= ts_end_timeline and ts_end >= ts_begin:
+            draw_timestamps.append((ts_begin, ts_end))
+        else:
+            draw_timestamps.append((0, 0))  # placeholder for invalid
+
+    # Map timestamps to func_idx values.
+    # When event_data is provided, use the event stream's dispatch func_idx
+    # values (matched by sequential dispatch order). This is necessary because
+    # the MIO draw metadata's func_idx field uses a different numbering scheme
+    # than the MTSP sequential counter used by read_gputrace().
+    timestamps: dict[int, tuple[int, int]] = {}
+    n_valid = 0
+
+    if event_data is not None:
+        # Extract dispatch func_idx values in order from the event stream
+        dispatch_func_indices = [
+            ev["index"]
+            for ev in event_data.get("events", [])
+            if ev.get("type") == "dispatch"
+        ]
+        for i, func_idx in enumerate(dispatch_func_indices):
+            if i < len(draw_timestamps) and draw_timestamps[i] != (0, 0):
+                timestamps[func_idx] = draw_timestamps[i]
+                n_valid += 1
+    else:
+        # Fall back to MIO draw metadata func_idx (offset 12 in draw struct)
+        _DRAW_META_STRIDE = 44
+        sel_draws = sel_registerName(b"draws")
+        draws_ptr = objc_msgSend_ptr(tl_ptr, sel_draws)
+        if draws_ptr:
+            raw_draws = ctypes.string_at(draws_ptr, draw_count * _DRAW_META_STRIDE)
+            for i in range(n_draws):
+                d_off = i * _DRAW_META_STRIDE
+                func_idx = struct.unpack_from("<I", raw_draws, d_off + 12)[0]
+                if draw_timestamps[i] != (0, 0):
+                    timestamps[func_idx] = draw_timestamps[i]
+                    n_valid += 1
+
+    gpu_time = timeline.gpuTime()
+
+    log.info(
+        "Extracted %d/%d dispatch timestamps (timeline: %.2f ms, GPU active: %.2f ms)",
+        n_valid, n_draws, ts_end_timeline / 1e6, gpu_time / 1e6,
+    )
+
+    return {
+        "timestamps": timestamps,
+        "timeline_end_ns": ts_end_timeline,
+        "gpu_time_ns": gpu_time,
+        "draw_count": n_valid,
+    }
+
+
+def read_gputrace_counters(
+    gputrace_path: str,
+    *,
+    replay: bool = False,
+    replay_timeout: int = 120,
+) -> dict[str, Any] | None:
+    """Extract derived GPU performance counter samples from streamData.
+
+    Uses GTShaderProfilerStreamDataProcessor → mioData() → overlapping
+    timeline → counterForName: to extract per-counter time-series data.
+
+    Searches for streamData in the gputrace bundle and Xcode's temp
+    profiling directory. If not found and replay=True, opens the
+    gputrace in Xcode and clicks Replay to trigger shader profiling.
+
+    Requires GTShaderProfiler.framework (loaded from GPUDebugger.ideplugin).
+    Returns None if streamData is missing or frameworks unavailable.
+
+    Returns a dict with keys:
+      counter_names  - list of counter name strings
+      num_samples    - number of periodic samples
+      timestamps_ns  - list of uint64 timestamps (MIO timeline ticks)
+      samples        - list of lists: samples[i][j] = float64 value for
+                       sample i, counter j
+    """
+    loaded = _load_mio_timeline(
+        gputrace_path, replay=replay, replay_timeout=replay_timeout,
+    )
+    if loaded is None:
+        return None
+
+    processor, mio, timeline, stream_path = loaded
 
     if timeline.profiledState() != 2:
         if replay:
@@ -1286,7 +1269,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    _ensure_dyld_framework_path()
+    ensure_dyld_framework_path()
 
     if args.counters_json:
         counters = read_gputrace_counters(args.trace_path)

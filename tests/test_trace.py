@@ -227,22 +227,22 @@ class TestGenericTableQuery:
     """Test generic table loading for arbitrary schemas."""
 
     def test_load_known_table(self, trace_file: TraceFile) -> None:
-        """_load_table should work for any schema, not just specialized ones."""
-        table = trace_file._load_table("cpu-profile")
+        """load_table should work for any schema, not just specialized ones."""
+        table = trace_file.load_table("cpu-profile")
         assert table.schema_name == "cpu-profile"
         assert len(table.columns) > 0
         assert len(table.rows) > 0
 
     def test_column_mnemonics(self, trace_file: TraceFile) -> None:
         """Columns should have mnemonics usable as dict keys."""
-        table = trace_file._load_table("potential-hangs")
+        table = trace_file.load_table("potential-hangs")
         mnemonics = [col.mnemonic for col in table.columns]
         assert "start" in mnemonics
         assert "duration" in mnemonics
 
     def test_row_values_as_strings(self, trace_file: TraceFile) -> None:
         """Row elements should serialize to string values via .value property."""
-        table = trace_file._load_table("potential-hangs")
+        table = trace_file.load_table("potential-hangs")
         col_index = {col.mnemonic: i for i, col in enumerate(table.columns)}
         row = table.rows[0]
         # start column should have a value

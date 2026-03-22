@@ -25,37 +25,16 @@ import warnings
 from collections import Counter
 
 import objc  # type: ignore[import-untyped]
-from Foundation import NSBundle, NSURL  # type: ignore[import-untyped]
+from Foundation import NSURL  # type: ignore[import-untyped]
 
 warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
 
-SHARED_FW = "/Applications/Xcode.app/Contents/SharedFrameworks"
-_FRAMEWORK_NAMES = [
-    "GPUToolsCore", "GPUTools", "GPUToolsPlatform",
-    "GLToolsCore", "GPUToolsServices",
-]
+try:
+    from ._frameworks import SHARED_FW, ensure_dyld_framework_path, load_frameworks
+except ImportError:
+    from _frameworks import SHARED_FW, ensure_dyld_framework_path, load_frameworks  # type: ignore[no-redef]
 
-
-def _ensure_dyld_framework_path() -> None:
-    """Re-exec with DYLD_FRAMEWORK_PATH if not set."""
-    if os.environ.get("DYLD_FRAMEWORK_PATH") != SHARED_FW:
-        os.environ["DYLD_FRAMEWORK_PATH"] = SHARED_FW
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
-
-def _load_frameworks() -> None:
-    for name in _FRAMEWORK_NAMES:
-        bundle = NSBundle.bundleWithPath_(f"{SHARED_FW}/{name}.framework")
-        if bundle is not None:
-            bundle.load()
-    sys_bundle = NSBundle.bundleWithPath_(
-        "/System/Library/PrivateFrameworks/GPUToolsCapture.framework"
-    )
-    if sys_bundle is not None:
-        sys_bundle.load()
-
-
-_load_frameworks()
+load_frameworks()
 
 DYCaptureArchive = objc.lookUpClass("DYCaptureArchive")
 DYFunctionTracer = objc.lookUpClass("DYFunctionTracer")
@@ -85,7 +64,7 @@ def hexdump(data: bytes, width: int = 16) -> str:
 
 
 def main() -> None:
-    _ensure_dyld_framework_path()
+    ensure_dyld_framework_path()
     path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/baspacho_ffi.gputrace"
 
     url = NSURL.fileURLWithPath_(path)

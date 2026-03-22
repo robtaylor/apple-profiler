@@ -220,7 +220,7 @@ class TestMetalTraceAnalysis:
         if not t.has_table("metal-driver-intervals"):
             pytest.skip("metal-driver-intervals table not present")
 
-        table = t._load_table("metal-driver-intervals")
+        table = t.load_table("metal-driver-intervals")
         assert len(table.rows) > 0, "metal-driver-intervals has no rows"
         assert len(table.columns) > 0
 
@@ -239,7 +239,7 @@ class TestMetalTraceAnalysis:
         if not t.has_table("metal-application-intervals"):
             pytest.skip("metal-application-intervals table not present")
 
-        table = t._load_table("metal-application-intervals")
+        table = t.load_table("metal-application-intervals")
         assert len(table.rows) > 0, "metal-application-intervals has no rows"
 
     def test_generic_query_serialization(self, metal_trace: Path) -> None:
@@ -249,7 +249,7 @@ class TestMetalTraceAnalysis:
         metal_table = None
         for tb in t.tables():
             if "metal" in tb.schema.lower():
-                table = t._load_table(tb.schema)
+                table = t.load_table(tb.schema)
                 if len(table.rows) > 0:
                     metal_table = table
                     break
@@ -292,7 +292,7 @@ class TestMetalTraceAnalysis:
         for tb in t.tables():
             if "metal" in tb.schema.lower() or "gpu" in tb.schema.lower():
                 try:
-                    table = t._load_table(tb.schema)
+                    table = t.load_table(tb.schema)
                     metal_tables.append((tb.schema, len(table.rows)))
                 except Exception:
                     metal_tables.append((tb.schema, -1))

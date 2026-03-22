@@ -60,14 +60,6 @@ class Frame:
     binary_uuid: str | None = None
 
 
-def _empty_frame_list() -> list[Frame]:
-    return []
-
-
-def _empty_str_dict() -> dict[str, str]:
-    return {}
-
-
 @dataclass
 class CpuSample:
     """A single CPU profile sample."""
@@ -78,7 +70,7 @@ class CpuSample:
     core: str
     state: str
     weight: int
-    backtrace: list[Frame] = field(default_factory=_empty_frame_list)
+    backtrace: list[Frame] = field(default_factory=list)
 
 
 @dataclass
@@ -130,4 +122,4 @@ class TableInfo:
     """Information about a data table in the trace."""
 
     schema: str
-    attributes: dict[str, str] = field(default_factory=_empty_str_dict)
+    attributes: dict[str, str] = field(default_factory=dict)

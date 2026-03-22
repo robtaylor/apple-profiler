@@ -79,7 +79,8 @@ class TraceFile:
             return self._info
 
         run = self._toc.find(".//run")
-        assert run is not None, "No run element found in TOC"
+        if run is None:
+            raise ValueError("No run element found in TOC")
 
         info = TraceInfo()
 
@@ -137,7 +138,7 @@ class TraceFile:
         """Check if the trace contains any CPU sample data."""
         return self._find_cpu_table() is not None
 
-    def _load_table(self, schema: str) -> ParsedTable:
+    def load_table(self, schema: str) -> ParsedTable:
         """Load and cache a table by schema name."""
         if schema not in self._table_cache:
             loader = self._table_loader
@@ -163,11 +164,12 @@ class TraceFile:
             end_ns: Include only samples at or before this timestamp (nanoseconds).
         """
         schema = self._find_cpu_table()
-        assert schema is not None, (
-            "No CPU sample table found. Available schemas: "
-            + ", ".join(t.schema for t in self.tables())
-        )
-        table = self._load_table(schema)
+        if schema is None:
+            available = ", ".join(t.schema for t in self.tables())
+            raise ValueError(
+                f"No CPU sample table found. Available schemas: {available}"
+            )
+        table = self.load_table(schema)
         col_index = _column_index(table)
         samples: list[CpuSample] = []
 
@@ -226,7 +228,7 @@ class TraceFile:
 
     def hangs(self) -> list[Hang]:
         """All detected hangs/unresponsiveness intervals."""
-        table = self._load_table("potential-hangs")
+        table = self.load_table("potential-hangs")
         col_index = _column_index(table)
         result: list[Hang] = []
 
@@ -262,7 +264,7 @@ class TraceFile:
         name: str | None = None,
     ) -> list[SignpostEvent]:
         """Raw signpost events with optional filtering."""
-        table = self._load_table("os-signpost")
+        table = self.load_table("os-signpost")
         col_index = _column_index(table)
         result: list[SignpostEvent] = []
 
@@ -317,7 +319,7 @@ class TraceFile:
         name: str | None = None,
     ) -> list[SignpostInterval]:
         """Matched signpost intervals with optional filtering."""
-        table = self._load_table("os-signpost-interval")
+        table = self.load_table("os-signpost-interval")
         col_index = _column_index(table)
         result: list[SignpostInterval] = []
 
@@ -395,12 +397,16 @@ class TraceFile:
 
 
 def _text(parent: object, tag: str) -> str:
-    """Get text content of a child element, or empty string."""
-    # parent is ET.Element but we use object for the type annotation
-    # because pyright doesn't like the overloaded find() method
+    """Get text content of a child element, or empty string.
+
+    Args:
+        parent: An xml.etree.ElementTree.Element. Typed as object because
+                pyright has trouble with Element.find()'s overloaded signatures.
+    """
     from xml.etree.ElementTree import Element
 
-    assert isinstance(parent, Element)
+    if not isinstance(parent, Element):
+        raise TypeError(f"Expected Element, got {type(parent).__name__}")
     elem = parent.find(tag)
     if elem is not None and elem.text:
         return elem.text.strip()

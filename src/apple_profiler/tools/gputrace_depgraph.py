@@ -44,19 +44,10 @@ from __future__ import annotations
 import os
 import sys
 
-_SHARED_FW = "/Applications/Xcode.app/Contents/SharedFrameworks"
-
-
-def _ensure_dyld_framework_path() -> None:
-    """Re-exec with DYLD_FRAMEWORK_PATH if not set.
-
-    dyld reads this variable at process startup to resolve @rpath references,
-    so it must be set before any GPU framework is loaded. When missing, we
-    set it and os.execv() to restart the process.
-    """
-    if os.environ.get("DYLD_FRAMEWORK_PATH") != _SHARED_FW:
-        os.environ["DYLD_FRAMEWORK_PATH"] = _SHARED_FW
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+try:
+    from ._frameworks import ensure_dyld_framework_path
+except ImportError:
+    from _frameworks import ensure_dyld_framework_path  # type: ignore[no-redef]
 
 import argparse
 import fnmatch
@@ -2001,7 +1992,7 @@ def _scale_suffix(scale: str) -> str:
 
 
 def main() -> None:
-    _ensure_dyld_framework_path()
+    ensure_dyld_framework_path()
     args = parse_args()
 
     # Import and run the timeline reader

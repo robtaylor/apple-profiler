@@ -12,9 +12,13 @@ Reads a .gputrace file via gputrace_timeline.read_gputrace() and outputs
 either Chrome Trace Event JSON or Perfetto protobuf (.pftrace) format,
 both loadable in ui.perfetto.dev.
 
-Since there are no wall-clock timestamps in the trace (only func_idx ordering),
-timestamps are synthesized: each dispatch/barrier occupies a 1µs slot at
-ts = func_idx. This preserves ordering and produces a readable timeline.
+When shader profiling data (streamData) is available, real GPU nanosecond
+timestamps are extracted from the MIO pipeline's drawTrace/draw arrays.
+These give actual per-dispatch GPU execution start/end times from the
+hardware profiler.
+
+When no profiling data is available, timestamps are synthesized from
+func_idx ordering (each dispatch occupies a 1µs slot at ts = func_idx).
 
 Two grouping modes:
 
@@ -59,6 +63,7 @@ log = logging.getLogger(__name__)
 def timeline_to_perfetto(
     data: dict[str, Any],
     group_by: str = "pipeline",
+    gpu_timestamps: dict[int, tuple[int, int]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Convert read_gputrace() output to Chrome Trace Event format.
 
@@ -66,14 +71,17 @@ def timeline_to_perfetto(
         data: Output from read_gputrace().
         group_by: "pipeline" groups tracks by kernel name (default),
                   "cb" groups by command buffer / encoder.
+        gpu_timestamps: Optional dict mapping func_idx → (ts_begin_ns, ts_end_ns)
+                        from read_gputrace_timestamps(). When provided, real GPU
+                        nanosecond timestamps are used instead of synthetic ones.
 
     Returns a dict with key "traceEvents" containing the event list,
     suitable for JSON serialization and loading in Perfetto/chrome://tracing.
     """
     if group_by == "pipeline":
-        return _group_by_pipeline(data)
+        return _group_by_pipeline(data, gpu_timestamps)
     elif group_by == "cb":
-        return _group_by_cb(data)
+        return _group_by_cb(data, gpu_timestamps)
     else:
         raise ValueError(f"Unknown group_by mode: {group_by!r}")
 
@@ -113,21 +121,56 @@ def _dispatch_args(event: dict[str, Any]) -> dict[str, Any]:
     return args
 
 
-def _build_dispatch_duration_map(events: list[dict[str, Any]]) -> dict[int, int]:
-    """Map each dispatch's func_idx to its duration (units = func_idx delta).
+def _build_dispatch_duration_map(
+    events: list[dict[str, Any]],
+    gpu_timestamps: dict[int, tuple[int, int]] | None = None,
+) -> dict[int, int]:
+    """Map each dispatch's func_idx to its duration.
 
-    Each dispatch lasts until the next dispatch in the global stream
-    (barriers are skipped — they're sync markers within a dispatch's span).
-    The last dispatch gets a duration of 1.
+    When gpu_timestamps is provided (from read_gputrace_timestamps),
+    uses real GPU nanosecond durations. Units are nanoseconds.
+
+    Otherwise falls back to func_idx delta durations (units = func_idx
+    increments, which are later multiplied by 1000 to produce ns).
     """
+    if gpu_timestamps:
+        dur: dict[int, int] = {}
+        for ev in events:
+            if ev.get("type") != "dispatch":
+                continue
+            func_idx = ev.get("index", 0)
+            ts = gpu_timestamps.get(func_idx)
+            if ts is not None:
+                dur[func_idx] = ts[1] - ts[0]
+            else:
+                dur[func_idx] = 1000  # 1µs fallback
+        return dur
+
     dispatch_indices = sorted(
         ev.get("index", 0) for ev in events if ev.get("type") == "dispatch"
     )
-    dur: dict[int, int] = {}
+    dur = {}
     for i, idx in enumerate(dispatch_indices):
         dur[idx] = dispatch_indices[i + 1] - idx if i + 1 < len(dispatch_indices) else 1
     return dur
 
+
+def _get_timestamp_ns(
+    func_idx: int,
+    gpu_timestamps: dict[int, tuple[int, int]] | None,
+    use_end: bool = False,
+) -> int:
+    """Return a timestamp in nanoseconds for a given func_idx.
+
+    When *gpu_timestamps* is provided and contains *func_idx*, returns the
+    real GPU timestamp (ts_begin or ts_end depending on *use_end*).
+    Otherwise falls back to the synthetic ``func_idx * 1000`` scheme.
+    """
+    if gpu_timestamps:
+        ts = gpu_timestamps.get(func_idx)
+        if ts is not None:
+            return ts[1] if use_end else ts[0]
+    return func_idx * 1000
 
 def _update_range(
     ranges: dict[int, tuple[int, int]], key: int, value: int,
@@ -155,14 +198,21 @@ def _update_range_str(
 # ---------------------------------------------------------------------------
 
 
-def _group_by_pipeline(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+def _group_by_pipeline(
+    data: dict[str, Any],
+    gpu_timestamps: dict[int, tuple[int, int]] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     """Group tracks by compute pipeline (kernel name).
 
     Each unique kernel gets a process (pid). All dispatches of that kernel
     appear chronologically on a single thread. Barriers go to a dedicated
     "Barriers" process.
+
+    When gpu_timestamps is provided, real nanosecond timestamps and durations
+    are used. Otherwise falls back to func_idx-based synthetic timestamps.
     """
     events: list[dict[str, Any]] = []
+    use_real_ts = gpu_timestamps is not None
 
     # Build encoder → CB mapping
     encoder_to_cb: dict[int, int] = {}
@@ -209,14 +259,21 @@ def _group_by_pipeline(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 args["cb_addr"] = cb_addr
             args["encoder"] = enc_idx
 
+            ts_ns = _get_timestamp_ns(func_idx, gpu_timestamps)
+            if use_real_ts and gpu_timestamps:
+                ts_pair = gpu_timestamps.get(func_idx)
+                dur_ns = (ts_pair[1] - ts_pair[0]) if ts_pair else 1000
+            else:
+                dur_ns = 1000  # 1µs in synthetic mode
+
             events.append({
                 "ph": "X",
                 "name": kernel,
                 "cat": "dispatch",
                 "pid": pid,
                 "tid": 0,
-                "ts": func_idx,
-                "dur": 1,
+                "ts": ts_ns / 1000,  # Chrome trace uses microseconds
+                "dur": dur_ns / 1000,
                 "args": args,
             })
 
@@ -224,13 +281,14 @@ def _group_by_pipeline(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
 
         elif etype == "barrier":
             scope = event.get("scope", "buffers")
+            ts_ns = _get_timestamp_ns(func_idx, gpu_timestamps)
             events.append({
                 "ph": "i",
                 "name": f"barrier ({scope})",
                 "cat": "barrier",
                 "pid": BARRIER_PID,
                 "tid": 0,
-                "ts": func_idx,
+                "ts": ts_ns / 1000,
                 "s": "t",
                 "args": {
                     "scope": scope,
@@ -289,12 +347,19 @@ def _group_by_pipeline(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
 # ---------------------------------------------------------------------------
 
 
-def _group_by_cb(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+def _group_by_cb(
+    data: dict[str, Any],
+    gpu_timestamps: dict[int, tuple[int, int]] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     """Group tracks by command buffer / encoder (original layout).
 
     Process (pid) = CB index, Thread (tid) = encoder index.
+
+    When gpu_timestamps is provided, real nanosecond timestamps and durations
+    are used. Otherwise falls back to func_idx-based synthetic timestamps.
     """
     events: list[dict[str, Any]] = []
+    use_real_ts = gpu_timestamps is not None
 
     # Build encoder → CB mapping from compute_encoders
     encoder_to_cb: dict[int, int] = {}
@@ -332,14 +397,21 @@ def _group_by_cb(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
             kernel = event.get("kernel", "unknown")
             args = _dispatch_args(event)
 
+            ts_ns = _get_timestamp_ns(func_idx, gpu_timestamps)
+            if use_real_ts and gpu_timestamps:
+                ts_pair = gpu_timestamps.get(func_idx)
+                dur_ns = (ts_pair[1] - ts_pair[0]) if ts_pair else 1000
+            else:
+                dur_ns = 1000
+
             events.append({
                 "ph": "X",
                 "name": kernel,
                 "cat": "dispatch",
                 "pid": pid,
                 "tid": tid,
-                "ts": func_idx,
-                "dur": 1,
+                "ts": ts_ns / 1000,
+                "dur": dur_ns / 1000,
                 "args": args,
             })
 
@@ -348,13 +420,14 @@ def _group_by_cb(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
 
         elif etype == "barrier":
             scope = event.get("scope", "buffers")
+            ts_ns = _get_timestamp_ns(func_idx, gpu_timestamps)
             events.append({
                 "ph": "i",
                 "name": f"barrier ({scope})",
                 "cat": "barrier",
                 "pid": pid,
                 "tid": tid,
-                "ts": func_idx,
+                "ts": ts_ns / 1000,
                 "s": "t",
                 "args": {"scope": scope},
             })
@@ -370,13 +443,15 @@ def _group_by_cb(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         if addr:
             label += f" ({addr})"
 
+        ts_begin = _get_timestamp_ns(fmin, gpu_timestamps) / 1000
+        ts_end = _get_timestamp_ns(fmax, gpu_timestamps, use_end=True) / 1000
         events.append({
             "ph": "B", "name": label, "cat": "encoder",
-            "pid": cb_idx, "tid": enc_idx, "ts": fmin,
+            "pid": cb_idx, "tid": enc_idx, "ts": ts_begin,
         })
         events.append({
             "ph": "E", "name": label, "cat": "encoder",
-            "pid": cb_idx, "tid": enc_idx, "ts": fmax + 1,
+            "pid": cb_idx, "tid": enc_idx, "ts": ts_end,
         })
 
     # CB overview spans on a dedicated tid
@@ -387,13 +462,15 @@ def _group_by_cb(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         if addr:
             label += f" ({addr})"
 
+        ts_begin = _get_timestamp_ns(fmin, gpu_timestamps) / 1000
+        ts_end = _get_timestamp_ns(fmax, gpu_timestamps, use_end=True) / 1000
         events.append({
             "ph": "B", "name": label, "cat": "command_buffer",
-            "pid": cb_idx, "tid": CB_OVERVIEW_TID, "ts": fmin,
+            "pid": cb_idx, "tid": CB_OVERVIEW_TID, "ts": ts_begin,
         })
         events.append({
             "ph": "E", "name": label, "cat": "command_buffer",
-            "pid": cb_idx, "tid": CB_OVERVIEW_TID, "ts": fmax + 1,
+            "pid": cb_idx, "tid": CB_OVERVIEW_TID, "ts": ts_end,
         })
 
     # Process name metadata
@@ -439,6 +516,7 @@ def timeline_to_pftrace(
     data: dict[str, Any],
     group_by: str = "pipeline",
     counters: dict[str, Any] | None = None,
+    gpu_timestamps: dict[int, tuple[int, int]] | None = None,
 ) -> bytes:
     """Convert read_gputrace() output to Perfetto protobuf (.pftrace) format.
 
@@ -448,13 +526,16 @@ def timeline_to_pftrace(
                   "cb" uses all TrackEvent (process per CB).
         counters: Optional output from read_gputrace_counters(). When provided,
                   GpuCounterEvent packets are appended for GPU utilization tracks.
+        gpu_timestamps: Optional mapping from func_idx to (ts_begin_ns, ts_end_ns)
+                  from read_gputrace_timestamps(). When provided, real GPU
+                  nanosecond timestamps replace synthetic func_idx*1000 values.
 
     Returns serialized protobuf bytes suitable for writing to a .pftrace file.
     """
     if group_by == "pipeline":
-        trace = _pftrace_pipeline(data)
+        trace = _pftrace_pipeline(data, gpu_timestamps=gpu_timestamps)
     elif group_by == "cb":
-        trace = _pftrace_cb(data)
+        trace = _pftrace_cb(data, gpu_timestamps=gpu_timestamps)
     else:
         raise ValueError(f"Unknown group_by mode: {group_by!r}")
 
@@ -469,7 +550,10 @@ def timeline_to_pftrace(
 _GPU_SEQ = 1
 
 
-def _pftrace_pipeline(data: dict[str, Any]) -> Any:
+def _pftrace_pipeline(
+    data: dict[str, Any],
+    gpu_timestamps: dict[int, tuple[int, int]] | None = None,
+) -> Any:
     """Pipeline-grouped pftrace: GpuRenderStageEvent dispatches + TrackEvent barriers/spans.
 
     Returns a pb.Trace() object (not yet serialized).
@@ -522,8 +606,11 @@ def _pftrace_pipeline(data: dict[str, Any]) -> Any:
     stage_spec.category = pb.InternedGpuRenderStageSpecification.COMPUTE
 
     # -- 2. GpuRenderStageEvent packets (dispatches) -----------------------
-    # Duration: each event lasts until the next event (Xcode-style).
-    dur_map = _build_dispatch_duration_map(data.get("events", []))
+    # Duration: use real GPU timestamps when available, otherwise fall back to
+    # the synthetic func_idx-delta approach.
+    dur_map: dict[int, int] | None = None
+    if not gpu_timestamps:
+        dur_map = _build_dispatch_duration_map(data.get("events", []))
 
     event_id = 0
     for ev in data.get("events", []):
@@ -536,7 +623,7 @@ def _pftrace_pipeline(data: dict[str, Any]) -> Any:
         cb_idx = encoder_to_cb.get(enc_idx, 0)
 
         pkt = trace.packet.add()
-        pkt.timestamp = func_idx * 1000  # ns
+        pkt.timestamp = _get_timestamp_ns(func_idx, gpu_timestamps)
         pkt.trusted_packet_sequence_id = _GPU_SEQ
 
         gpu = pkt.gpu_render_stage_event
@@ -544,7 +631,11 @@ def _pftrace_pipeline(data: dict[str, Any]) -> Any:
         event_id += 1
         gpu.hw_queue_iid = kernel_to_iid[kernel] + 1  # 1-based
         gpu.stage_iid = STAGE_IID
-        gpu.duration = dur_map.get(func_idx, 1) * 1000  # ns
+        if gpu_timestamps:
+            ts_pair = gpu_timestamps.get(func_idx)
+            gpu.duration = (ts_pair[1] - ts_pair[0]) if ts_pair else 1000
+        else:
+            gpu.duration = (dur_map or {}).get(func_idx, 1) * 1000  # ns
         gpu.submission_id = cb_idx
 
         # command_buffer_handle is uint64 — parse hex addr
@@ -597,7 +688,10 @@ _CB_ENCODER_BASE = 3000    # encoder N -> 3000+N
 _CB_PFTRACE_SEQ = 1
 
 
-def _pftrace_cb(data: dict[str, Any]) -> Any:
+def _pftrace_cb(
+    data: dict[str, Any],
+    gpu_timestamps: dict[int, tuple[int, int]] | None = None,
+) -> Any:
     """CB-grouped pftrace: all TrackEvent — process per CB, child tracks per encoder.
 
     Returns a pb.Trace() object (not yet serialized).
@@ -680,8 +774,11 @@ def _pftrace_cb(data: dict[str, Any]) -> Any:
         enc_pkt.track_descriptor.name = label
 
     # -- 2. Dispatch slices + barrier instants on encoder tracks ------------
-    # Duration: each event lasts until the next event (Xcode-style).
-    dur_map = _build_dispatch_duration_map(data.get("events", []))
+    # Duration: use real GPU timestamps when available, otherwise fall back to
+    # the synthetic func_idx-delta approach.
+    dur_map: dict[int, int] | None = None
+    if not gpu_timestamps:
+        dur_map = _build_dispatch_duration_map(data.get("events", []))
 
     first_event = True
     for ev in data.get("events", []):
@@ -692,11 +789,18 @@ def _pftrace_cb(data: dict[str, Any]) -> Any:
 
         if etype == "dispatch":
             kernel = ev.get("kernel", "unknown")
-            dur = dur_map.get(func_idx, 1)
+
+            ts_begin_ns = _get_timestamp_ns(func_idx, gpu_timestamps)
+            if gpu_timestamps:
+                ts_pair = gpu_timestamps.get(func_idx)
+                ts_end_ns = ts_pair[1] if ts_pair else ts_begin_ns + 1000
+            else:
+                dur = (dur_map or {}).get(func_idx, 1)
+                ts_end_ns = (func_idx + dur) * 1000
 
             # SLICE_BEGIN
             begin_pkt = trace.packet.add()
-            begin_pkt.timestamp = func_idx * 1000
+            begin_pkt.timestamp = ts_begin_ns
             begin_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
             if first_event:
                 begin_pkt.sequence_flags = 1  # SEQ_INCREMENTAL_STATE_CLEARED
@@ -738,7 +842,7 @@ def _pftrace_cb(data: dict[str, Any]) -> Any:
 
             # SLICE_END
             end_pkt = trace.packet.add()
-            end_pkt.timestamp = (func_idx + dur) * 1000
+            end_pkt.timestamp = ts_end_ns
             end_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
             end_te = end_pkt.track_event
             end_te.type = pb.TrackEvent.TYPE_SLICE_END
@@ -748,7 +852,7 @@ def _pftrace_cb(data: dict[str, Any]) -> Any:
             scope = ev.get("scope", "buffers")
 
             pkt = trace.packet.add()
-            pkt.timestamp = func_idx * 1000
+            pkt.timestamp = _get_timestamp_ns(func_idx, gpu_timestamps)
             pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
             if first_event:
                 pkt.sequence_flags = 1
@@ -777,7 +881,7 @@ def _pftrace_cb(data: dict[str, Any]) -> Any:
             label += f" ({addr})"
 
         begin_pkt = trace.packet.add()
-        begin_pkt.timestamp = lo * 1000
+        begin_pkt.timestamp = _get_timestamp_ns(lo, gpu_timestamps)
         begin_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
         if first_event:
             begin_pkt.sequence_flags = 1
@@ -788,7 +892,7 @@ def _pftrace_cb(data: dict[str, Any]) -> Any:
         begin_te.name = label
 
         end_pkt = trace.packet.add()
-        end_pkt.timestamp = (hi + 1) * 1000
+        end_pkt.timestamp = _get_timestamp_ns(hi, gpu_timestamps, use_end=True)
         end_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
         end_te = end_pkt.track_event
         end_te.type = pb.TrackEvent.TYPE_SLICE_END
@@ -804,7 +908,7 @@ def _pftrace_cb(data: dict[str, Any]) -> Any:
             label += f" ({addr})"
 
         begin_pkt = trace.packet.add()
-        begin_pkt.timestamp = lo * 1000
+        begin_pkt.timestamp = _get_timestamp_ns(lo, gpu_timestamps)
         begin_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
         if first_event:
             begin_pkt.sequence_flags = 1
@@ -815,7 +919,7 @@ def _pftrace_cb(data: dict[str, Any]) -> Any:
         begin_te.name = label
 
         end_pkt = trace.packet.add()
-        end_pkt.timestamp = (hi + 1) * 1000
+        end_pkt.timestamp = _get_timestamp_ns(hi, gpu_timestamps, use_end=True)
         end_pkt.trusted_packet_sequence_id = _CB_PFTRACE_SEQ
         end_te = end_pkt.track_event
         end_te.type = pb.TrackEvent.TYPE_SLICE_END
@@ -831,143 +935,16 @@ def _pftrace_cb(data: dict[str, Any]) -> Any:
 _COUNTER_SEQ = 3
 
 # Counter name → display group for Perfetto track grouping.
-# Counters in the same group appear under a collapsible parent track.
-# Names must match the keys in _COUNTER_CATEGORY_ORDER in gputrace_timeline.py.
-_COUNTER_GROUP_MAP: dict[str, str] = {
-    # GPU activity & cores
-    "GT Active Core Count": "GPU Activity",
-    "Raytracing Active GT": "GPU Activity",
-    # Occupancy
-    "Total Occupancy": "Occupancy",
-    "Compute Occupancy": "Occupancy",
-    "Fragment Occupancy": "Occupancy",
-    "Vertex Occupancy": "Occupancy",
-    "Occupancy Manager Target": "Occupancy",
-    "Total Simdgroups Inflight Per Shader Core": "Occupancy",
-    "Compute Simdgroups Inflight Per Shader Core": "Occupancy",
-    "Fragment Simdgroups Inflight Per Shader Core": "Occupancy",
-    "Vertex Simdgroups Inflight Per Shader Core": "Occupancy",
-    "Occupancy Management L1 Eviction Rate": "Occupancy",
-    # Memory bandwidth
-    "AF Bandwidth": "Memory Bandwidth",
-    "AF Read Bandwidth": "Memory Bandwidth",
-    "AF Write Bandwidth": "Memory Bandwidth",
-    "AF Peak Bandwidth": "Memory Bandwidth",
-    "AF Peak Read Bandwidth": "Memory Bandwidth",
-    "AF Peak Write Bandwidth": "Memory Bandwidth",
-    "L2 Bandwidth": "Memory Bandwidth",
-    # Shader core utilization & instruction throughput
-    "Shader Core Utilization": "Shader Utilization",
-    "Shader Core Limiter": "Shader Utilization",
-    "ALU Utilization": "Shader Utilization",
-    "F16 Utilization": "Shader Utilization",
-    "F16 Limiter": "Shader Utilization",
-    "F32 Utilization": "Shader Utilization",
-    "F32 Limiter": "Shader Utilization",
-    "IC Utilization": "Shader Utilization",
-    "IC Limiter": "Shader Utilization",
-    "SCIB Utilization": "Shader Utilization",
-    "SCIB Limiter": "Shader Utilization",
-    "Control Flow Utilization": "Shader Utilization",
-    "Control Flow Limiter": "Shader Utilization",
-    "Instruction Dispatch Utilization": "Shader Utilization",
-    "Instruction Dispatch Limiter": "Shader Utilization",
-    "Instruction Issue Utilization": "Shader Utilization",
-    "Instruction Issue Limiter": "Shader Utilization",
-    "Address Generation Utilization": "Shader Utilization",
-    "Address Generation Limiter": "Shader Utilization",
-    # Shader launch
-    "Compute Shader Launch Utilization": "Shader Launch",
-    "Compute Shader Launch Limiter": "Shader Launch",
-    "Fragment Shader Launch Utilization": "Shader Launch",
-    "Fragment Shader Launch Limiter": "Shader Launch",
-    "Vertex Shader Launch Utilization": "Shader Launch",
-    "Vertex Shader Launch Limiter": "Shader Launch",
-    # L1 cache bandwidth
-    "L1 Load Bandwidth": "L1 Cache",
-    "L1 Store Bandwidth": "L1 Cache",
-    "L1 Cache Utilization": "L1 Cache",
-    "L1 Cache Limiter": "L1 Cache",
-    "Buffer L1 Load Bandwidth": "L1 Cache",
-    "Buffer L1 Store Bandwidth": "L1 Cache",
-    "Buffer L1 Load Ratio": "L1 Cache",
-    "Buffer L1 Store Ratio": "L1 Cache",
-    "Buffer L1 Miss Rate": "L1 Cache",
-    "Imageblock L1 Load Bandwidth": "L1 Cache",
-    "Imageblock L1 Store Bandwidth": "L1 Cache",
-    "Imageblock L1 Load Ratio": "L1 Cache",
-    "Imageblock L1 Store Ratio": "L1 Cache",
-    "Threadgroup Memory L1 Load Bandwidth": "L1 Cache",
-    "Threadgroup Memory L1 Store Bandwidth": "L1 Cache",
-    "Threadgroup L1 Load Ratio": "L1 Cache",
-    "Threadgroup L1 Store Ratio": "L1 Cache",
-    "Stack L1 Load Bandwidth": "L1 Cache",
-    "Stack L1 Store Bandwidth": "L1 Cache",
-    "Stack L1 Load Ratio": "L1 Cache",
-    "Stack L1 Store Ratio": "L1 Cache",
-    "GPR L1 Load Bandwidth": "L1 Cache",
-    "GPR L1 Store Bandwidth": "L1 Cache",
-    "GPR L1 Read Ratio": "L1 Cache",
-    "GPR L1 Write Ratio": "L1 Cache",
-    "Other L1 Load Bandwidth": "L1 Cache",
-    "Other L1 Store Bandwidth": "L1 Cache",
-    "Other L1 Loads Ratio": "L1 Cache",
-    "Other L1 Stores Ratio": "L1 Cache",
-    # L1 residency
-    "L1 Total Occupancy": "L1 Residency",
-    "L1 Total Bytes Occupancy": "L1 Residency",
-    "L1 Buffer Occupancy": "L1 Residency",
-    "L1 Buffer Bytes Occupancy": "L1 Residency",
-    "L1 Imageblock Occupancy": "L1 Residency",
-    "L1 Imageblock Bytes Occupancy": "L1 Residency",
-    "L1 Threadgroup Occupancy": "L1 Residency",
-    "L1 Threadgroup Bytes Occupancy": "L1 Residency",
-    "L1 GPR Occupancy": "L1 Residency",
-    "L1 GPR Bytes Occupancy": "L1 Residency",
-    "L1 Stack Occupancy": "L1 Residency",
-    "L1 Stack Bytes Occupancy": "L1 Residency",
-    "L1 Other Occupancy": "L1 Residency",
-    "L1 Other Bytes Occupancy": "L1 Residency",
-    "L1 Raytracing Scratch Occupancy": "L1 Residency",
-    "L1 Raytracing Scratch Bytes Occupancy": "L1 Residency",
-    # L2 / texture / MMU
-    "L2 Cache Utilization": "L2 / Texture / MMU",
-    "L2 Cache Limiter": "L2 / Texture / MMU",
-    "Texture Cache Utilization": "L2 / Texture / MMU",
-    "Texture Cache Limiter": "L2 / Texture / MMU",
-    "Texture Read Utilization": "L2 / Texture / MMU",
-    "Texture Read Limiter": "L2 / Texture / MMU",
-    "Texture Write Utilization": "L2 / Texture / MMU",
-    "Texture Write Limiter": "L2 / Texture / MMU",
-    "TextureFilteringLimiter": "L2 / Texture / MMU",
-    "CompressionRatioTextureMemoryRead": "L2 / Texture / MMU",
-    "MMU Utilization": "L2 / Texture / MMU",
-    "MMU Limiter": "L2 / Texture / MMU",
-    # Raytracing
-    "Raytracing Active": "Raytracing",
-    "Ray Occupancy": "Raytracing",
-    "Leaf Test Occupancy": "Raytracing",
-    "Ray T Leaf Test": "Raytracing",
-    "Raytracing Node Test": "Raytracing",
-    "Intersect Ray Threads": "Raytracing",
-    "Raytracing Scratch L1 Load Bandwidth": "Raytracing",
-    "Raytracing Scratch L1 Store Bandwidth": "Raytracing",
-    "Raytracing Scratch L1 Load Ratio": "Raytracing",
-    "Raytracing Scratch L1 Store Ratio": "Raytracing",
-}
+# Single source of truth in _gpu_counters.py.
+try:
+    from ._gpu_counters import build_group_map, group_order
+except ImportError:
+    from _gpu_counters import build_group_map, group_order  # type: ignore[no-redef]
+
+_COUNTER_GROUP_MAP: dict[str, str] = build_group_map()
 
 # Group display order in the Perfetto UI (lower = higher in the list)
-_GROUP_ORDER: list[str] = [
-    "GPU Activity",
-    "Occupancy",
-    "Memory Bandwidth",
-    "Shader Utilization",
-    "Shader Launch",
-    "L1 Cache",
-    "L1 Residency",
-    "L2 / Texture / MMU",
-    "Raytracing",
-]
+_GROUP_ORDER: list[str] = group_order()
 
 # Base UUID offset for counter tracks (must not collide with other track UUIDs)
 _COUNTER_UUID_BASE = 0x6700_0000
@@ -1133,16 +1110,19 @@ def main() -> None:
         "--json", action="store_true",
         help="Output export metadata as JSON to stdout (for MCP integration)",
     )
+    parser.add_argument(
+        "--no-timestamps", action="store_true",
+        help="Disable real GPU timestamps (use synthetic func_idx ordering instead)",
+    )
     args = parser.parse_args()
-
-    import os
 
     # gputrace_timeline loads Apple GPU frameworks at import time, which
     # requires DYLD_FRAMEWORK_PATH to be set. Re-exec if missing.
-    _shared_fw = "/Applications/Xcode.app/Contents/SharedFrameworks"
-    if os.environ.get("DYLD_FRAMEWORK_PATH") != _shared_fw:
-        os.environ["DYLD_FRAMEWORK_PATH"] = _shared_fw
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+    try:
+        from ._frameworks import ensure_dyld_framework_path
+    except ImportError:
+        from _frameworks import ensure_dyld_framework_path  # type: ignore[no-redef]
+    ensure_dyld_framework_path()
 
     try:
         from .gputrace_timeline import read_gputrace
@@ -1187,6 +1167,23 @@ def main() -> None:
             else:
                 log.warning("No GPU counter data found (shader profiling not enabled?)")
 
+    # Extract real GPU timestamps from MIO pipeline (enabled by default)
+    gpu_timestamps: dict[int, tuple[int, int]] | None = None
+    if not args.no_timestamps:
+        try:
+            from .gputrace_timeline import read_gputrace_timestamps
+        except ImportError:
+            from gputrace_timeline import read_gputrace_timestamps  # type: ignore[no-redef]
+        ts_result = read_gputrace_timestamps(args.gputrace, event_data=trace_data)
+        if ts_result:
+            gpu_timestamps = ts_result["timestamps"]
+            log.info(
+                "GPU timestamps: %d dispatches with real nanosecond timing",
+                len(gpu_timestamps),
+            )
+        else:
+            log.info("No MIO timestamp data; using synthetic func_idx ordering")
+
     ext = ".pftrace" if args.format == "pftrace" else ".json"
     output_path = args.output
     if output_path is None:
@@ -1196,13 +1193,16 @@ def main() -> None:
     if args.format == "pftrace":
         trace_bytes = timeline_to_pftrace(
             trace_data, group_by=args.group_by, counters=counter_data,
+            gpu_timestamps=gpu_timestamps,
         )
         with open(output_path, "wb") as f:
             f.write(trace_bytes)
         output_size = len(trace_bytes)
         log.info("Wrote %d bytes to %s", output_size, output_path)
     else:
-        perfetto = timeline_to_perfetto(trace_data, group_by=args.group_by)
+        perfetto = timeline_to_perfetto(
+            trace_data, group_by=args.group_by, gpu_timestamps=gpu_timestamps,
+        )
         with open(output_path, "w") as f:
             json.dump(perfetto, f, indent=2)
         output_size = os.path.getsize(output_path)

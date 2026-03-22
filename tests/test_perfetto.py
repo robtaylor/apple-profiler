@@ -7,15 +7,11 @@ Apple frameworks or .gputrace files.
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
 
 import pytest
 
-# Add tools dir to import the module
-sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
-
-from gputrace_perfetto import timeline_to_perfetto  # noqa: E402
+# Import from the package tools module
+from apple_profiler.tools.gputrace_perfetto import timeline_to_perfetto  # noqa: E402
 
 
 def _make_trace_data(

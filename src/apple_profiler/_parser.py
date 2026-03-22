@@ -16,10 +16,6 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 
-def _empty_str_dict() -> dict[str, str]:
-    return {}
-
-
 @dataclass
 class ResolvedElement:
     """A fully-resolved XML element with all id/ref lookups completed."""
@@ -27,7 +23,7 @@ class ResolvedElement:
     tag: str
     text: str | None = None
     fmt: str | None = None
-    attrs: dict[str, str] = field(default_factory=_empty_str_dict)
+    attrs: dict[str, str] = field(default_factory=dict)
     children: list[ResolvedElement] = field(default_factory=lambda: [])
 
     def child(self, tag: str) -> ResolvedElement | None:
