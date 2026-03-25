@@ -280,10 +280,14 @@ class TestProfilerGpuOpen:
                 GpuTracePathInput(gputrace_path="/tmp/test.gputrace")
             )
         data = json.loads(result)
-        assert data["total_functions"] == 500
+        assert data["total_api_calls"] == 500
         assert data["num_dispatches"] == 3
         assert data["num_barriers"] == 1
-        assert len(data["kernels"]) == 2
+        assert data["num_command_buffers"] == 1
+        assert data["num_compute_encoders"] == 2
+        # kernel_summary aggregates dispatch counts by kernel name
+        assert len(data["kernel_summary"]) == 2
+        # With <= 50 CBs/encoders, detail lists are included
         assert len(data["command_buffers"]) == 1
         assert len(data["compute_encoders"]) == 2
 

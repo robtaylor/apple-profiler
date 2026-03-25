@@ -162,6 +162,100 @@ def _parse_hex_addrs(trace: str) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
+# device-resources pipeline name resolver
+# ---------------------------------------------------------------------------
+
+_DEVRES_ADDR_SHIFT = 8  # device-resources stores page-aligned addresses (<<8)
+
+
+def _parse_device_resources(gputrace_path: str) -> dict[int, str]:
+    """Parse the device-resources binary to resolve pipeline addresses to kernel names.
+
+    The device-resources file (MTSP format) in a .gputrace bundle contains the full
+    set of MTLComputePipelineState objects and the MTLFunction objects they reference.
+    This lets us resolve pipeline addresses even for pipelines created *before* the
+    capture started (which don't appear in the unsorted-capture function stream).
+
+    Returns a dict mapping runtime pipeline addresses to kernel function names.
+    """
+    entries = os.listdir(gputrace_path)
+    dev_res = [e for e in entries if e.startswith("device-resources-")]
+    if not dev_res:
+        return {}
+
+    try:
+        data = Path(gputrace_path, dev_res[0]).read_bytes()
+    except OSError:
+        return {}
+
+    # Verify MTSP magic
+    if data[:4] != b"MTSP":
+        return {}
+
+    # Step 1: Build function address -> name table.
+    # Each individual 'function' entry contains a kernel name string.
+    # The function's runtime address is stored 64 bytes before the name.
+    func_addr_to_name: dict[int, str] = {}
+    func_marker = b"\x00function\x00"
+    pos = 0
+    while True:
+        pos = data.find(func_marker, pos)
+        if pos == -1:
+            break
+        after = pos + len(func_marker)
+        # Skip 'functions' container and 'function-handles' entries
+        if after < len(data) and data[after : after + 1] in (b"s", b"-"):
+            pos += 1
+            continue
+        chunk = data[after : after + 200]
+        name_match = re.search(rb"([a-zA-Z_]\w{8,})", chunk)
+        if name_match:
+            name_abs = after + name_match.start()
+            if name_abs >= 64:
+                func_addr = struct.unpack_from("<Q", data, name_abs - 64)[0]
+                if func_addr > 0x100000000:
+                    func_addr_to_name[func_addr] = name_match.group(1).decode()
+        pos += 1
+
+    if not func_addr_to_name:
+        return {}
+
+    # Step 2: Parse compute-pipeline-state entries.
+    # Each entry has: pipeline address at +0, function reference at +64
+    # (both offsets relative to end of the null-terminated tag string).
+    # Addresses in device-resources are shifted left by _DEVRES_ADDR_SHIFT bits
+    # compared to runtime addresses used in the capture stream.
+    cp_marker = b"compute-pipeline-state\x00"
+    pos = 0
+    pipeline_map: dict[int, str] = {}
+    while True:
+        pos = data.find(cp_marker, pos)
+        if pos == -1:
+            break
+        # Skip the plural 'compute-pipeline-states' container
+        if pos > 0 and data[pos - 1 : pos] == b"s":
+            pos += 1
+            continue
+        base = pos + 23  # after "compute-pipeline-state\0"
+        if base + 72 > len(data):
+            pos += 1
+            continue
+        pipe_addr_raw = struct.unpack_from("<Q", data, base)[0]
+        func_ref_raw = struct.unpack_from("<Q", data, base + 64)[0]
+
+        # Shift right to get runtime addresses
+        func_ref = func_ref_raw >> _DEVRES_ADDR_SHIFT
+        pipe_addr = pipe_addr_raw >> _DEVRES_ADDR_SHIFT
+
+        name = func_addr_to_name.get(func_ref)
+        if name:
+            pipeline_map[pipe_addr] = name
+        pos += 1
+
+    return pipeline_map
+
+
+# ---------------------------------------------------------------------------
 # Main reader
 # ---------------------------------------------------------------------------
 
@@ -523,6 +617,35 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                     "dispatches": cb_info["dispatches"],
                 }
             )
+
+    # Resolve any "Compute Pipeline 0x..." names using device-resources
+    devres_names = _parse_device_resources(path)
+    if devres_names:
+        # Build a string-based lookup for events that only have the name string
+        str_lookup: dict[str, str] = {}
+        for addr, name in devres_names.items():
+            str_lookup[f"Compute Pipeline 0x{addr:x}"] = name
+
+        resolved_count = 0
+        for event in events:
+            kernel = event.get("kernel", "")
+            if kernel.startswith("Compute Pipeline 0x"):
+                resolved_name = str_lookup.get(kernel)
+                if not resolved_name:
+                    # Try pipeline_addr field (set_pipeline events have it)
+                    addr = event.get("pipeline_addr")
+                    if addr:
+                        resolved_name = devres_names.get(addr)
+                if resolved_name:
+                    event["kernel"] = resolved_name
+                    resolved_count += 1
+
+        # Also update the pipelines dict
+        for addr, name in devres_names.items():
+            if addr not in pipelines:
+                pipelines[addr] = name
+        if resolved_count:
+            log.info("Resolved %d pipeline names from device-resources", resolved_count)
 
     return {
         "metadata": metadata,

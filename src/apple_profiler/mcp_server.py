@@ -875,33 +875,59 @@ async def profiler_gpu_open(params: GpuTracePathInput) -> str:
             cache_key=resolved,
             cache_store=_gpu_trace_cache,
         )
-        return json.dumps(
-            {
-                "metadata": data["metadata"],
-                "total_functions": data["total_functions"],
-                "kernels": data["kernels"],
-                "pipelines": data.get("pipelines", {}),
-                "num_dispatches": len([e for e in data["events"] if e["type"] == "dispatch"]),
-                "num_barriers": len([e for e in data["events"] if e["type"] == "barrier"]),
-                "command_buffers": [
-                    {
-                        "index": i,
-                        "addr": cb.get("addr", ""),
-                        "num_dispatches": len(cb["dispatches"]),
-                    }
-                    for i, cb in enumerate(data["command_buffers"])
-                ],
-                "compute_encoders": [
-                    {
-                        "encoder_idx": enc["encoder_idx"],
-                        "cb_idx": enc["command_buffer_idx"],
-                        "num_dispatches": len(enc["dispatches"]),
-                    }
-                    for enc in data["compute_encoders"]
-                ],
-            },
-            indent=2,
-        )
+
+        # Build compact kernel summary (deduplicated names with dispatch counts)
+        from collections import Counter
+
+        kernel_dispatch_counts: Counter[str] = Counter()
+        for evt in data["events"]:
+            if evt["type"] == "dispatch":
+                kernel_dispatch_counts[evt.get("kernel", "unknown")] += 1
+
+        num_dispatches = sum(kernel_dispatch_counts.values())
+        num_barriers = len([e for e in data["events"] if e["type"] == "barrier"])
+        num_cbs = len(data["command_buffers"])
+        num_encoders = len(data["compute_encoders"])
+
+        # Kernel breakdown sorted by dispatch count
+        kernel_summary = [
+            {"kernel": name, "dispatches": count}
+            for name, count in kernel_dispatch_counts.most_common()
+        ]
+
+        result: dict[str, object] = {
+            "metadata": data["metadata"],
+            "total_api_calls": data["total_functions"],
+            "num_dispatches": num_dispatches,
+            "num_barriers": num_barriers,
+            "num_command_buffers": num_cbs,
+            "num_compute_encoders": num_encoders,
+            "avg_dispatches_per_cb": round(num_dispatches / max(num_cbs, 1), 1),
+            "kernel_summary": kernel_summary,
+        }
+
+        # Include per-CB/encoder detail only when compact enough
+        _DETAIL_THRESHOLD = 50
+        if num_cbs <= _DETAIL_THRESHOLD:
+            result["command_buffers"] = [
+                {
+                    "index": i,
+                    "addr": cb.get("addr", ""),
+                    "num_dispatches": len(cb["dispatches"]),
+                }
+                for i, cb in enumerate(data["command_buffers"])
+            ]
+        if num_encoders <= _DETAIL_THRESHOLD:
+            result["compute_encoders"] = [
+                {
+                    "encoder_idx": enc["encoder_idx"],
+                    "cb_idx": enc["command_buffer_idx"],
+                    "num_dispatches": len(enc["dispatches"]),
+                }
+                for enc in data["compute_encoders"]
+            ]
+
+        return json.dumps(result, indent=2)
     except Exception as e:
         logger.exception("Error opening GPU trace: %s", params.gputrace_path)
         return f"Error opening GPU trace: {e}"
