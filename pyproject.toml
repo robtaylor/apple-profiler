@@ -1,6 +1,6 @@
 [project]
 name = "apple-profiler"
-version = "0.3.1"
+version = "0.3.2"
 description = "MCP server for CPU and GPU performance profiling on Apple platforms"
 requires-python = ">=3.10"
 readme = "README.md"
