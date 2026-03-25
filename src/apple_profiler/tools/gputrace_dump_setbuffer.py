@@ -14,30 +14,49 @@ accurate (non-conservative) dependency graphs.
 Usage:
     uv run tools/gputrace_dump_setbuffer.py /path/to/capture.gputrace
 """
+
 from __future__ import annotations
 
 import ctypes
-import os
 import re
 import struct
 import sys
 import warnings
 from collections import Counter
-
-import objc  # type: ignore[import-untyped]
-from Foundation import NSURL  # type: ignore[import-untyped]
-
-warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
+from typing import Any
 
 try:
-    from ._frameworks import SHARED_FW, ensure_dyld_framework_path, load_frameworks
+    from ._frameworks import ensure_dyld_framework_path, load_frameworks
 except ImportError:
-    from _frameworks import SHARED_FW, ensure_dyld_framework_path, load_frameworks  # type: ignore[no-redef]
+    from _frameworks import (  # type: ignore[no-redef]
+        ensure_dyld_framework_path,
+        load_frameworks,
+    )
 
-load_frameworks()
+# Deferred ObjC globals — set by _init_objc_runtime()
+_objc_initialized = False
+objc: Any = None
+NSURL: Any = None
+DYCaptureArchive: Any = None
+DYFunctionTracer: Any = None
 
-DYCaptureArchive = objc.lookUpClass("DYCaptureArchive")
-DYFunctionTracer = objc.lookUpClass("DYFunctionTracer")
+
+def _init_objc_runtime() -> None:
+    """Load ObjC frameworks and look up classes. Called once on first use."""
+    global _objc_initialized, objc, NSURL, DYCaptureArchive, DYFunctionTracer
+    if _objc_initialized:
+        return
+    import objc as _objc  # type: ignore[import-untyped]
+    from Foundation import NSURL as _NSURL  # type: ignore[import-untyped]
+
+    objc = _objc
+    NSURL = _NSURL
+    warnings.filterwarnings("ignore", category=_objc.ObjCPointerWarning)
+    load_frameworks()
+    DYCaptureArchive = _objc.lookUpClass("DYCaptureArchive")
+    DYFunctionTracer = _objc.lookUpClass("DYFunctionTracer")
+    _objc_initialized = True
+
 
 SET_BUFFER_IDX = -16336  # setBuffer:offset:atIndex:
 
@@ -56,7 +75,7 @@ def hexdump(data: bytes, width: int = 16) -> str:
     """Format bytes as a hex dump with ASCII sidebar."""
     lines = []
     for i in range(0, len(data), width):
-        chunk = data[i:i + width]
+        chunk = data[i : i + width]
         hex_part = " ".join(f"{b:02x}" for b in chunk)
         ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
         lines.append(f"  {i:4d}: {hex_part:<{width * 3}}  {ascii_part}")
@@ -65,6 +84,7 @@ def hexdump(data: bytes, width: int = 16) -> str:
 
 def main() -> None:
     ensure_dyld_framework_path()
+    _init_objc_runtime()
     path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/baspacho_ffi.gputrace"
 
     url = NSURL.fileURLWithPath_(path)
@@ -89,7 +109,7 @@ def main() -> None:
     # Track buffer indices seen with their MTSP patterns
     buffer_index_patterns: dict[int, list[bytes]] = {}
 
-    print(f"=== MTSP Record Dump for setBuffer:offset:atIndex: ===")
+    print("=== MTSP Record Dump for setBuffer:offset:atIndex: ===")
     print(f"File: {path}")
     print(f"Dumping first {max_dump} records\n")
 
@@ -111,10 +131,7 @@ def main() -> None:
             trace = str(tracer.traceFunction_error_(func_ptr, None))
 
             # Extract buffer address from trace
-            hex_addrs = [
-                int(m.group(1), 16)
-                for m in re.finditer(r"0x([0-9a-fA-F]+)l?", trace)
-            ]
+            hex_addrs = [int(m.group(1), 16) for m in re.finditer(r"0x([0-9a-fA-F]+)l?", trace)]
             buffer_addr = hex_addrs[0] if hex_addrs else 0
 
             # Extract buffer index from trace
@@ -167,7 +184,7 @@ def main() -> None:
 
             if count < max_dump:
                 # Also dump the argument region (offsets 24-120) for access mode bits
-                print(f"  Argument region (offsets 24-120):")
+                print("  Argument region (offsets 24-120):")
                 print(hexdump(func_struct[24:120]))
                 print()
 
@@ -175,7 +192,7 @@ def main() -> None:
 
         func_idx += 1
 
-    print(f"\n=== Summary ===")
+    print("\n=== Summary ===")
     print(f"Total setBuffer calls: {count}")
 
     if mtsp_byte_patterns:
@@ -187,9 +204,7 @@ def main() -> None:
             values = Counter(p[offset] for p in mtsp_byte_patterns)
             if len(values) > 1:
                 top = values.most_common(3)
-                vals_str = ", ".join(
-                    f"0x{v:02x}({c})" for v, c in top
-                )
+                vals_str = ", ".join(f"0x{v:02x}({c})" for v, c in top)
                 print(f"  Offset {offset:3d}: {len(values)} distinct values: {vals_str}")
 
         # Look for consistent differences between buffer indices

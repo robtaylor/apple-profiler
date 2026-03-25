@@ -1,6 +1,6 @@
 # apple-profiler
 
-A Claude Code plugin that wraps `xctrace` to parse and analyze Instruments `.trace` files. It exposes CPU profiling, hang detection, signpost analysis, Metal/GPU trace data, and generic table queries as MCP tools — letting Claude investigate performance issues directly from trace recordings.
+A Claude Code plugin that wraps `xctrace` to parse and analyze Instruments `.trace` files and Metal `.gputrace` bundles. It exposes CPU profiling, hang detection, signpost analysis, correlated CPU+GPU timelines, Metal GPU trace analysis, and generic table queries as MCP tools — letting Claude investigate performance issues directly from trace recordings.
 
 ## Installation
 
@@ -16,6 +16,8 @@ claude plugin add apple-profiler
 
 ## Available Tools
 
+### CPU Analysis (`.trace` files)
+
 | Tool | Description |
 |------|-------------|
 | `profiler_open_trace` | Open a `.trace` file, return device info, duration, and available tables |
@@ -26,6 +28,23 @@ claude plugin add apple-profiler
 | `profiler_signpost_intervals` | Matched signpost intervals (begin+end pairs) with durations |
 | `profiler_query_table` | Query any data table by schema name — works with Metal, thermal, disk I/O, etc. |
 | `profiler_list_tables` | List all available data tables and their schemas |
+
+### Correlated CPU+GPU Analysis (Metal System Trace `.trace` files)
+
+| Tool | Description |
+|------|-------------|
+| `profiler_correlated_timeline` | Time-aligned CPU+GPU timeline with auto-detected phases (CPU_BOUND, GPU_BOUND, BALANCED, PIPELINE_BUBBLE, IDLE) |
+
+### GPU Trace Analysis (`.gputrace` files)
+
+| Tool | Description |
+|------|-------------|
+| `profiler_gpu_open` | Structural overview: kernels, command buffers, encoders, dispatch/barrier counts |
+| `profiler_gpu_timeline` | Detailed dispatch events with kernel names, threadgroup sizes, buffer bindings |
+| `profiler_gpu_dependencies` | Buffer hazard DAG with critical path analysis at dispatch, encoder, kernel, or command buffer scale |
+| `profiler_gpu_counters` | Shader profiling counters (occupancy, bandwidth, cache rates) — requires Xcode replay |
+| `profiler_gpu_export_perfetto` | Export GPU timeline to `.pftrace` for visualization in ui.perfetto.dev |
+| `profiler_gpu_scheduling` | Scheduling overhead analysis: inter-encoder gaps and dispatch fusion candidates |
 
 ## Usage Examples
 
@@ -58,6 +77,24 @@ profiler_cpu_samples(trace_path="recording.trace",
 2. profiler_hangs(trace_path="recording.trace")
 ```
 
+### Correlated CPU+GPU Timeline
+
+```
+1. profiler_open_trace(trace_path="metal-system.trace")
+2. profiler_correlated_timeline(trace_path="metal-system.trace")
+   # Returns per-bucket CPU/GPU activity with phase classification
+```
+
+### GPU Trace Analysis
+
+```
+1. profiler_gpu_open(trace_path="capture.gputrace")
+2. profiler_gpu_scheduling(trace_path="capture.gputrace")
+3. profiler_gpu_dependencies(trace_path="capture.gputrace", scale="kernel")
+4. profiler_gpu_timeline(trace_path="capture.gputrace", kernel_filter="matmul")
+5. profiler_gpu_export_perfetto(trace_path="capture.gputrace", output_path="/tmp/out.pftrace")
+```
+
 ### Metal System Trace
 
 ```
@@ -86,12 +123,28 @@ xctrace record --template "CPU Profiler" --launch -- ./my-app
 # Time Profiler with an already-running process
 xctrace record --template "Time Profiler" --attach <pid> --time-limit 10s
 
-# Metal System Trace
+# Metal System Trace (CPU + GPU correlation)
 xctrace record --template "Metal System Trace" --launch -- ./my-metal-app
 
 # Hangs detection
 xctrace record --template "Hangs" --launch -- ./my-app
 ```
+
+### Capturing GPU Traces
+
+GPU traces (`.gputrace` bundles) capture the full Metal command stream:
+
+```bash
+# Capture via environment variables
+MTL_CAPTURE_ENABLED=1 METAL_CAPTURE_ENABLED=1 ./my-metal-app
+
+# Specify output path
+MTL_CAPTURE_ENABLED=1 METAL_CAPTURE_ENABLED=1 \
+  METAL_CAPTURE_OUTPUT_PATH=/tmp/capture.gputrace \
+  ./my-metal-app
+```
+
+For programmatic capture of specific code sections, use `MTLCaptureManager` — see CLAUDE.md for details.
 
 ## Development
 

@@ -39,9 +39,9 @@ Usage:
     # Filter to specific kernels
     ... gputrace_depgraph.py trace.gputrace --filter-kernel "lu_factor*"
 """
+
 from __future__ import annotations
 
-import os
 import sys
 
 try:
@@ -69,6 +69,7 @@ log = logging.getLogger(__name__)
 # Data model
 # ---------------------------------------------------------------------------
 
+
 class AccessMode(Enum):
     READ = "READ"
     WRITE = "WRITE"
@@ -77,9 +78,9 @@ class AccessMode(Enum):
 
 
 class DepType(Enum):
-    RAW = "RAW"   # Read After Write — true dependency
-    WAW = "WAW"   # Write After Write — output dependency
-    WAR = "WAR"   # Write After Read — anti-dependency
+    RAW = "RAW"  # Read After Write — true dependency
+    WAW = "WAW"  # Write After Write — output dependency
+    WAR = "WAR"  # Write After Read — anti-dependency
     SHARED = "SHARED"  # Conservative: shared buffer, unknown access
 
 
@@ -109,8 +110,9 @@ class BarrierNode:
     Barriers enforce ordering: all dispatches before the barrier in the same
     encoder must complete before any dispatch after it can begin.
     """
+
     barrier_id: int
-    scope: str              # "buffers" or "resources"
+    scope: str  # "buffers" or "resources"
     encoder_idx: int = -1
     command_buffer_idx: int = -1
     after_dispatch_id: int = -1  # last dispatch before this barrier
@@ -146,6 +148,7 @@ class DependencyGraph:
 # Extract dispatches from gputrace timeline
 # ---------------------------------------------------------------------------
 
+
 def _import_read_gputrace():
     """Import read_gputrace from the timeline tool."""
     try:
@@ -162,9 +165,10 @@ def _import_read_gputrace():
 @dataclass
 class TraceMetadata:
     """Metadata extracted alongside dispatch/barrier nodes."""
+
     num_cbs: int
     num_encoders: int
-    cb_addrs: dict[int, str] = field(default_factory=dict)   # cb_idx → hex addr
+    cb_addrs: dict[int, str] = field(default_factory=dict)  # cb_idx → hex addr
     enc_addrs: dict[int, str] = field(default_factory=dict)  # enc_idx → hex addr
 
 
@@ -209,11 +213,13 @@ def extract_dispatches(
         if etype == "dispatch":
             buffers = []
             for buf_index, buf_addr in event.get("buffers_bound", {}).items():
-                buffers.append(BufferBinding(
-                    buffer_addr=buf_addr,
-                    buffer_index=int(buf_index),
-                    access_mode=AccessMode.UNKNOWN,
-                ))
+                buffers.append(
+                    BufferBinding(
+                        buffer_addr=buf_addr,
+                        buffer_index=int(buf_index),
+                        access_mode=AccessMode.UNKNOWN,
+                    )
+                )
 
             enc_idx = event.get("encoder_idx", -1)
             node = DispatchNode(
@@ -234,13 +240,15 @@ def extract_dispatches(
             enc_idx = event.get("encoder_idx", -1)
             scope = event.get("scope", "buffers")
             after_did = last_dispatch_in_encoder.get(enc_idx, -1)
-            barriers.append(BarrierNode(
-                barrier_id=barrier_id,
-                scope=scope,
-                encoder_idx=enc_idx,
-                command_buffer_idx=event.get("command_buffer_idx", -1),
-                after_dispatch_id=after_did,
-            ))
+            barriers.append(
+                BarrierNode(
+                    barrier_id=barrier_id,
+                    scope=scope,
+                    encoder_idx=enc_idx,
+                    command_buffer_idx=event.get("command_buffer_idx", -1),
+                    after_dispatch_id=after_did,
+                )
+            )
             barrier_id += 1
 
     meta = TraceMetadata(
@@ -255,6 +263,7 @@ def extract_dispatches(
 # ---------------------------------------------------------------------------
 # Dependency graph construction
 # ---------------------------------------------------------------------------
+
 
 def build_dependency_graph(
     nodes: list[DispatchNode],
@@ -313,12 +322,14 @@ def _build_conservative(
                 src = last_user[addr]
                 tgt = node.dispatch_id
                 if src != tgt and (src, tgt) not in seen_edges:
-                    graph.add_edge(DependencyEdge(
-                        source_id=src,
-                        target_id=tgt,
-                        dep_type=DepType.SHARED,
-                        buffer_addr=addr,
-                    ))
+                    graph.add_edge(
+                        DependencyEdge(
+                            source_id=src,
+                            target_id=tgt,
+                            dep_type=DepType.SHARED,
+                            buffer_addr=addr,
+                        )
+                    )
                     seen_edges.add((src, tgt))
             last_user[addr] = node.dispatch_id
 
@@ -434,18 +445,21 @@ def _apply_barrier_edges(
         first_after = after[0]
 
         if (last_before, first_after) not in existing_edges:
-            graph.add_edge(DependencyEdge(
-                source_id=last_before,
-                target_id=first_after,
-                dep_type=DepType.SHARED,
-                buffer_addr=0,  # barrier-induced, no specific buffer
-            ))
+            graph.add_edge(
+                DependencyEdge(
+                    source_id=last_before,
+                    target_id=first_after,
+                    dep_type=DepType.SHARED,
+                    buffer_addr=0,  # barrier-induced, no specific buffer
+                )
+            )
             existing_edges.add((last_before, first_after))
 
 
 # ---------------------------------------------------------------------------
 # Transitive reduction
 # ---------------------------------------------------------------------------
+
 
 def transitive_reduction(graph: DependencyGraph) -> DependencyGraph:
     """Remove edges implied by transitivity to simplify the graph.
@@ -486,7 +500,8 @@ def transitive_reduction(graph: DependencyGraph) -> DependencyGraph:
     if redundant:
         log.info(
             "Transitive reduction removed %d/%d edges",
-            len(redundant), len(graph.edges),
+            len(redundant),
+            len(graph.edges),
         )
 
     # Build new graph without redundant edges
@@ -501,6 +516,7 @@ def transitive_reduction(graph: DependencyGraph) -> DependencyGraph:
 # ---------------------------------------------------------------------------
 # DAG validation
 # ---------------------------------------------------------------------------
+
 
 def validate_dag(graph: DependencyGraph) -> bool:
     """Check that the graph has no cycles (is a valid DAG)."""
@@ -572,9 +588,9 @@ def format_dot(
 
     lines = [
         "digraph gpu_deps {",
-        '  rankdir=TB;',
+        "  rankdir=TB;",
         '  node [shape=box, style="rounded,filled", fillcolor=lightyellow, fontsize=10];',
-        '  edge [fontsize=8];',
+        "  edge [fontsize=8];",
         "",
     ]
 
@@ -598,7 +614,7 @@ def format_dot(
             if cb_idx in _cb_addrs:
                 cb_label += f" ({_cb_addrs[cb_idx]})"
             lines.append(f'    label="{cb_label}";')
-            lines.append('    style=dashed; color=gray60;')
+            lines.append("    style=dashed; color=gray60;")
             for node in nodes_in_cb:
                 lines.append(f"    {_dot_node(node)}")
             lines.append("  }")
@@ -619,8 +635,8 @@ def format_dot(
                 continue
             scope_label = "B" if b.scope == "buffers" else "R"
             lines.append(
-                f'  barrier{b.barrier_id} [shape=diamond, '
-                f'style=filled, fillcolor=lightsalmon, '
+                f"  barrier{b.barrier_id} [shape=diamond, "
+                f"style=filled, fillcolor=lightsalmon, "
                 f'label="{scope_label}", width=0.4, height=0.4, '
                 f'tooltip="barrier #{b.barrier_id} ({b.scope})"];'
             )
@@ -661,10 +677,7 @@ def format_dot(
                     f"  D{b.after_dispatch_id} -> barrier{b.barrier_id} "
                     f"[style=dashed, color=red, arrowhead=none];"
                 )
-                lines.append(
-                    f"  barrier{b.barrier_id} -> D{after[0]} "
-                    f"[style=dashed, color=red];"
-                )
+                lines.append(f"  barrier{b.barrier_id} -> D{after[0]} [style=dashed, color=red];")
 
     lines.append("}")
     return "\n".join(lines)
@@ -685,10 +698,11 @@ def format_kernel_dot(graph: DependencyGraph) -> str:
 # Aggregated graph data model and builders
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class AggregatedNode:
-    node_id: str           # "CB0", "E5", "K3"
-    label: str             # "CB #0\n65 dispatches, 3 barriers\nlu_gemv(48), lu_solve(17)"
+    node_id: str  # "CB0", "E5", "K3"
+    label: str  # "CB #0\n65 dispatches, 3 barriers\nlu_gemv(48), lu_solve(17)"
     dispatch_count: int
     kernel_composition: dict[str, int]  # kernel → count
     barrier_count: int = 0
@@ -710,7 +724,7 @@ class AggregatedNode:
 class AggregatedEdge:
     source_id: str
     target_id: str
-    weight: int            # number of dispatch-level edges this represents
+    weight: int  # number of dispatch-level edges this represents
     buffer_addrs: set[int] = field(default_factory=set)
 
 
@@ -739,7 +753,7 @@ def build_cb_graph(
 
     # Count barriers per CB
     cb_barrier_count: dict[int, int] = defaultdict(int)
-    for b in (barriers or []):
+    for b in barriers or []:
         cb_barrier_count[b.command_buffer_idx] += 1
 
     # Group dispatches by CB
@@ -766,7 +780,11 @@ def build_cb_graph(
         node = agg_nodes[nid]
         b_str = f", {b_count} barriers" if b_count else ""
         addr_str = f" ({_cb_addrs[cb_idx]})" if cb_idx in _cb_addrs else ""
-        node.label = f"CB #{cb_idx}{addr_str}\\n{node.dispatch_count} dispatches{b_str}\\n{node.short_composition}"
+        node.label = (
+            f"CB #{cb_idx}{addr_str}\\n"
+            f"{node.dispatch_count} dispatches{b_str}\\n"
+            f"{node.short_composition}"
+        )
 
     # Build aggregated edges
     agg_edges: dict[tuple[str, str], AggregatedEdge] = {}
@@ -778,7 +796,9 @@ def build_cb_graph(
         key = (f"CB{src_cb}", f"CB{tgt_cb}")
         if key not in agg_edges:
             agg_edges[key] = AggregatedEdge(
-                source_id=key[0], target_id=key[1], weight=0,
+                source_id=key[0],
+                target_id=key[1],
+                weight=0,
             )
         agg_edges[key].weight += 1
         agg_edges[key].buffer_addrs.add(edge.buffer_addr)
@@ -807,7 +827,7 @@ def build_encoder_graph(
 
     # Count barriers per encoder
     enc_barrier_count: dict[int, int] = defaultdict(int)
-    for b in (barriers or []):
+    for b in barriers or []:
         enc_barrier_count[b.encoder_idx] += 1
 
     # Group dispatches by encoder
@@ -838,7 +858,9 @@ def build_encoder_graph(
         comp = node.short_composition
         b_str = f", {b_count} barriers" if b_count else ""
         addr_str = f" ({_enc_addrs[enc_idx]})" if enc_idx in _enc_addrs else ""
-        node.label = f"Encoder #{enc_idx}{addr_str}\\n{node.dispatch_count} dispatches{b_str}\\n{comp}"
+        node.label = (
+            f"Encoder #{enc_idx}{addr_str}\\n{node.dispatch_count} dispatches{b_str}\\n{comp}"
+        )
 
     # Build aggregated edges
     agg_edges: dict[tuple[str, str], AggregatedEdge] = {}
@@ -850,7 +872,9 @@ def build_encoder_graph(
         key = (f"E{src_enc}", f"E{tgt_enc}")
         if key not in agg_edges:
             agg_edges[key] = AggregatedEdge(
-                source_id=key[0], target_id=key[1], weight=0,
+                source_id=key[0],
+                target_id=key[1],
+                weight=0,
             )
         agg_edges[key].weight += 1
         agg_edges[key].buffer_addrs.add(edge.buffer_addr)
@@ -924,7 +948,9 @@ def build_kernel_graph(
         key = (kernel_to_nid[src_k], kernel_to_nid[tgt_k])
         if key not in agg_edges:
             agg_edges[key] = AggregatedEdge(
-                source_id=key[0], target_id=key[1], weight=0,
+                source_id=key[0],
+                target_id=key[1],
+                weight=0,
             )
         agg_edges[key].weight += 1
         agg_edges[key].buffer_addrs.add(edge.buffer_addr)
@@ -947,9 +973,9 @@ def format_aggregated_dot(
     """
     lines = [
         f"digraph {title} {{",
-        '  rankdir=TB;',
+        "  rankdir=TB;",
         '  node [shape=box, style="rounded,filled", fillcolor=lightyellow, fontsize=11];',
-        '  edge [fontsize=9];',
+        "  edge [fontsize=9];",
         "",
     ]
 
@@ -959,20 +985,15 @@ def format_aggregated_dot(
     def _node_line(node: AggregatedNode) -> str:
         # Scale width 1.5..4 based on dispatch count
         width = 1.5 + 2.5 * (node.dispatch_count / max(max_count, 1))
-        return (
-            f'  {node.node_id} [label="{node.label}", '
-            f'width={width:.1f}];'
-        )
+        return f'  {node.node_id} [label="{node.label}", width={width:.1f}];'
 
     if agg.clusters:
         # Emit clustered nodes
         emitted: set[str] = set()
-        for i, (cluster_label, node_ids) in enumerate(
-            sorted(agg.clusters.items())
-        ):
+        for i, (cluster_label, node_ids) in enumerate(sorted(agg.clusters.items())):
             lines.append(f"  subgraph cluster_{i} {{")
             lines.append(f'    label="{cluster_label}";')
-            lines.append('    style=dashed; color=gray60;')
+            lines.append("    style=dashed; color=gray60;")
             for node in agg.nodes:
                 if node.node_id in node_ids:
                     lines.append(f"  {_node_line(node)}")
@@ -993,7 +1014,7 @@ def format_aggregated_dot(
         pw = min(1 + edge.weight / 50, 5)
         bufs = len(edge.buffer_addrs)
         lines.append(
-            f'  {edge.source_id} -> {edge.target_id} '
+            f"  {edge.source_id} -> {edge.target_id} "
             f'[label="{edge.weight}", penwidth={pw:.1f}, '
             f'tooltip="{bufs} shared buffers"];'
         )
@@ -1025,6 +1046,7 @@ def _dot_node(node: DispatchNode) -> str:
 # ---------------------------------------------------------------------------
 # JSON output
 # ---------------------------------------------------------------------------
+
 
 def format_json(graph: DependencyGraph) -> dict[str, Any]:
     """Format the dependency graph as a JSON-serializable dict."""
@@ -1302,8 +1324,7 @@ function nodeSearchText(n) {{
   const d = n.data();
   const parts = [d.id || '', d.label || '', d.kernel || ''];
   if (d.cb !== undefined && d.cb >= 0) parts.push('CB#' + d.cb, 'CB #' + d.cb);
-  if (d.encoder !== undefined && d.encoder >= 0) parts.push('E#' + d.encoder, 'Encoder #' + d.encoder);
-  if (d.composition) {{
+  if (d.encoder !== undefined && d.encoder >= 0) parts.push('E#' + d.encoder, 'Encoder #' + d.encoder);  if (d.composition) {{
     for (const k of Object.keys(d.composition)) parts.push(k);
   }}
   return parts.join(' ').toLowerCase();
@@ -1344,8 +1365,7 @@ function doSearch(q) {{
   nextBtn.style.display = count > 1 ? 'inline-block' : 'none';
 
   if (count === 1) {{
-    cy.animate({{ center: searchMatches[0].position(), zoom: Math.max(cy.zoom(), 0.8), duration: 300 }});
-    searchMatches[0].select();
+    cy.animate({{ center: searchMatches[0].position(), zoom: Math.max(cy.zoom(), 0.8), duration: 300 }});    searchMatches[0].select();
     searchIdx = 0;
   }} else if (count > 1) {{
     jumpToMatch(0);
@@ -1400,8 +1420,7 @@ cy.on('tap', 'node', (evt) => {{
     html += '<tr><td>ID</td><td>D' + d.dispatch_id + '</td></tr>';
     html += '<tr><td>Kernel</td><td>' + d.kernel + '</td></tr>';
     html += '<tr><td>CB</td><td>' + (d.cb >= 0 ? '#' + d.cb : 'unassigned') + '</td></tr>';
-    html += '<tr><td>Encoder</td><td>' + (d.encoder >= 0 ? '#' + d.encoder : 'unassigned') + '</td></tr>';
-    html += '<tr><td>Buffers</td><td>' + d.buf_count + '</td></tr>';
+    html += '<tr><td>Encoder</td><td>' + (d.encoder >= 0 ? '#' + d.encoder : 'unassigned') + '</td></tr>';    html += '<tr><td>Buffers</td><td>' + d.buf_count + '</td></tr>';
     if (d.threadgroups) html += '<tr><td>Threadgroups</td><td>' + d.threadgroups + '</td></tr>';
     if (d.tpt) html += '<tr><td>Threads/TG</td><td>' + d.tpt + '</td></tr>';
   }} else if (d.type === 'aggregated') {{
@@ -1537,13 +1556,15 @@ def _dispatch_graph_to_cytoscape(
         label = f"Command Buffer #{cb_idx}"
         if cb_idx in _cb_addrs:
             label += f" ({_cb_addrs[cb_idx]})"
-        elements.append({
-            "data": {
-                "id": f"cb_group_{cb_idx}",
-                "label": label,
-                "type": "cluster",
-            },
-        })
+        elements.append(
+            {
+                "data": {
+                    "id": f"cb_group_{cb_idx}",
+                    "label": label,
+                    "type": "cluster",
+                },
+            }
+        )
 
     # Dispatch nodes
     for node in graph.nodes:
@@ -1625,24 +1646,32 @@ def _dispatch_graph_to_cytoscape(
             dispatches_in_enc = enc_dispatches.get(b.encoder_idx, [])
             after = [d for d in dispatches_in_enc if d > b.after_dispatch_id]
             if after:
-                elements.append({"data": {
-                    "id": f"be_pre_{b.barrier_id}",
-                    "source": f"D{b.after_dispatch_id}",
-                    "target": f"barrier{b.barrier_id}",
-                    "label": "",
-                    "color": "#e63946",
-                    "width": 1.5,
-                    "dashed": True,
-                }})
-                elements.append({"data": {
-                    "id": f"be_post_{b.barrier_id}",
-                    "source": f"barrier{b.barrier_id}",
-                    "target": f"D{after[0]}",
-                    "label": "",
-                    "color": "#e63946",
-                    "width": 1.5,
-                    "dashed": True,
-                }})
+                elements.append(
+                    {
+                        "data": {
+                            "id": f"be_pre_{b.barrier_id}",
+                            "source": f"D{b.after_dispatch_id}",
+                            "target": f"barrier{b.barrier_id}",
+                            "label": "",
+                            "color": "#e63946",
+                            "width": 1.5,
+                            "dashed": True,
+                        }
+                    }
+                )
+                elements.append(
+                    {
+                        "data": {
+                            "id": f"be_post_{b.barrier_id}",
+                            "source": f"barrier{b.barrier_id}",
+                            "target": f"D{after[0]}",
+                            "label": "",
+                            "color": "#e63946",
+                            "width": 1.5,
+                            "dashed": True,
+                        }
+                    }
+                )
 
     return {"elements": elements}
 
@@ -1666,20 +1695,23 @@ def _aggregated_to_cytoscape(agg: AggregatedGraph) -> dict[str, Any]:
                 cluster_parent[nid] = cluster_id
 
     # Emit clusters and their children together (helps dagre layout order)
-    children_by_cluster: dict[str, list] = {}
     node_lookup = {n.node_id: n for n in agg.nodes}
     emitted: set[str] = set()
 
     if agg.clusters:
-        for cluster_label, node_ids in sorted(agg.clusters.items(), key=lambda x: _cluster_sort_key(x[0])):
+        for cluster_label, node_ids in sorted(
+            agg.clusters.items(), key=lambda x: _cluster_sort_key(x[0])
+        ):
             cluster_id = f"cluster_{cluster_label.replace(' ', '_').replace('#', '')}"
-            elements.append({
-                "data": {
-                    "id": cluster_id,
-                    "label": cluster_label,
-                    "type": "cluster",
-                },
-            })
+            elements.append(
+                {
+                    "data": {
+                        "id": cluster_id,
+                        "label": cluster_label,
+                        "type": "cluster",
+                    },
+                }
+            )
             # Emit child nodes immediately after their cluster
             for nid in node_ids:
                 node = node_lookup.get(nid)
@@ -1718,15 +1750,19 @@ def _aggregated_to_cytoscape(agg: AggregatedGraph) -> dict[str, Any]:
     # Aggregated edges
     for edge in sorted(agg.edges, key=lambda e: -e.weight):
         pw = min(1 + edge.weight / 50, 5)
-        elements.append({"data": {
-            "id": f"e_{edge.source_id}_{edge.target_id}",
-            "source": edge.source_id,
-            "target": edge.target_id,
-            "label": str(edge.weight),
-            "color": "#6c757d",
-            "width": pw,
-            "dashed": False,
-        }})
+        elements.append(
+            {
+                "data": {
+                    "id": f"e_{edge.source_id}_{edge.target_id}",
+                    "source": edge.source_id,
+                    "target": edge.target_id,
+                    "label": str(edge.weight),
+                    "color": "#6c757d",
+                    "width": pw,
+                    "dashed": False,
+                }
+            }
+        )
 
     return {"elements": elements}
 
@@ -1753,7 +1789,9 @@ def format_html(
     """
     if scale == "dispatch":
         cyto_data = _dispatch_graph_to_cytoscape(
-            graph, barriers=barriers, cb_addrs=cb_addrs,
+            graph,
+            barriers=barriers,
+            cb_addrs=cb_addrs,
         )
     else:
         assert agg is not None, f"Aggregated graph required for scale={scale}"
@@ -1802,6 +1840,7 @@ def _compute_critical_path_length(graph: DependencyGraph) -> int:
 # ---------------------------------------------------------------------------
 # Summary output
 # ---------------------------------------------------------------------------
+
 
 def print_summary(
     graph: DependencyGraph,
@@ -1890,13 +1929,15 @@ def parse_args() -> argparse.Namespace:
         help="Path to .gputrace file",
     )
     p.add_argument(
-        "-f", "--format",
+        "-f",
+        "--format",
         choices=["dot", "json", "html", "both"],
         default="both",
         help="Output format (default: both)",
     )
     p.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         help="Output path (without extension for 'both' format)",
     )
     p.add_argument(
@@ -2008,7 +2049,10 @@ def main() -> None:
     nodes, barriers, meta = extract_dispatches(trace_data)
     log.info(
         "Extracted %d dispatches, %d barriers from %d command buffers, %d encoders",
-        len(nodes), len(barriers), meta.num_cbs, meta.num_encoders,
+        len(nodes),
+        len(barriers),
+        meta.num_cbs,
+        meta.num_encoders,
     )
 
     if not nodes:
@@ -2037,23 +2081,22 @@ def main() -> None:
         log.error(
             "Dispatch-level graph has %d nodes (threshold: %d). "
             "Use --filter-cb, --filter-encoder, or --filter-kernel to scope.",
-            len(nodes), _MAX_UNSCOPED_DISPATCHES,
+            len(nodes),
+            _MAX_UNSCOPED_DISPATCHES,
         )
         sys.exit(1)
 
     # Filter barriers to match filtered dispatches
     if has_filter:
         # Keep only barriers in filtered encoders with valid dispatch refs
-        filtered_dispatch_ids = {n.dispatch_id for n in nodes}
         filtered_encoders = {n.encoder_idx for n in nodes}
-        barriers = [
-            b for b in barriers
-            if b.encoder_idx in filtered_encoders
-        ]
+        barriers = [b for b in barriers if b.encoder_idx in filtered_encoders]
 
     # Build dependency graph
     graph = build_dependency_graph(
-        nodes, conservative=args.conservative, barriers=barriers,
+        nodes,
+        conservative=args.conservative,
+        barriers=barriers,
     )
     log.info("Built graph: %d edges", len(graph.edges))
 
@@ -2094,13 +2137,12 @@ def main() -> None:
     suffix = _scale_suffix(scale)
 
     if scale == "cb":
-        agg = build_cb_graph(nodes, graph, barriers=barriers,
-                             cb_addrs=meta.cb_addrs)
+        agg = build_cb_graph(nodes, graph, barriers=barriers, cb_addrs=meta.cb_addrs)
         dot_content = format_aggregated_dot(agg, title="cb_deps")
     elif scale == "encoder":
-        agg = build_encoder_graph(nodes, graph, barriers=barriers,
-                                  enc_addrs=meta.enc_addrs,
-                                  cb_addrs=meta.cb_addrs)
+        agg = build_encoder_graph(
+            nodes, graph, barriers=barriers, enc_addrs=meta.enc_addrs, cb_addrs=meta.cb_addrs
+        )
         dot_content = format_aggregated_dot(agg, title="encoder_deps")
     elif scale == "kernel":
         agg = build_kernel_graph(nodes, graph)
@@ -2133,20 +2175,26 @@ def main() -> None:
             n_nodes = len(agg.nodes)
         else:
             n_nodes = sum(
-                1 for n in graph.nodes
-                if any(e.source_id == n.dispatch_id or e.target_id == n.dispatch_id
-                       for e in graph.edges)
+                1
+                for n in graph.nodes
+                if any(
+                    e.source_id == n.dispatch_id or e.target_id == n.dispatch_id
+                    for e in graph.edges
+                )
             )
 
         if n_nodes > 500:
             log.info(
                 "Large graph (%d nodes). Use sfdp: sfdp -Tsvg %s -o %s",
-                n_nodes, dot_path, dot_path.with_suffix(".svg"),
+                n_nodes,
+                dot_path,
+                dot_path.with_suffix(".svg"),
             )
         else:
             log.info(
                 "Render: dot -Tsvg %s -o %s",
-                dot_path, dot_path.with_suffix(".svg"),
+                dot_path,
+                dot_path.with_suffix(".svg"),
             )
 
     # Output JSON
@@ -2188,7 +2236,9 @@ def main() -> None:
         if suffix:
             html_path = html_path.with_stem(html_path.stem + suffix)
         html_content = format_html(
-            graph, scale=scale, agg=agg,
+            graph,
+            scale=scale,
+            agg=agg,
             barriers=barriers if barriers else None,
             cb_addrs=meta.cb_addrs,
             title=Path(args.trace_path).stem,

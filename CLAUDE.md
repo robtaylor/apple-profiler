@@ -171,11 +171,15 @@ The `profiler_gpu_counters` tool requires shader profiling data (streamData) whi
 - `profiler_list_tables` — Discover all available schemas in the trace.
 - `profiler_query_table` — Query any table by schema name. Use this for Metal GPU tables, thermal data, disk I/O, or anything not covered by the specialized tools above.
 
+### Correlated CPU+GPU analysis (Metal System Trace `.trace` files)
+- `profiler_correlated_timeline` — Time-bucketed view showing CPU and GPU activity side by side. Auto-detects execution phases: `CPU_BOUND`, `GPU_BOUND`, `BALANCED`, `PIPELINE_BUBBLE`, `IDLE`. Returns per-bucket breakdown plus summary with bottleneck classification.
+
 ### GPU trace analysis (`.gputrace` files)
 - `profiler_gpu_open` — Structural overview: kernels, command buffers, encoders, dispatch/barrier counts.
 - `profiler_gpu_timeline` — Detailed dispatch events with kernel names, threadgroup sizes, buffer bindings. Filter by kernel pattern, command buffer, or encoder.
 - `profiler_gpu_dependencies` — Buffer hazard DAG with critical path analysis. View at dispatch, encoder, kernel, or command buffer scale.
 - `profiler_gpu_counters` — Shader profiling counters (occupancy, bandwidth, cache rates). Summary stats or full time-series.
+- `profiler_gpu_scheduling` — Scheduling overhead analysis. Identifies inter-encoder gaps (GPU idle between encoder submissions) and dispatch fusion candidates (many small dispatches that could be combined). Returns prioritized recommendations with estimated savings. Requires shader profiling data (streamData).
 - `profiler_gpu_export_perfetto` — Export to `.pftrace` for visualization in ui.perfetto.dev.
 
 ## Analysis Patterns
@@ -206,10 +210,11 @@ The `profiler_gpu_counters` tool requires shader profiling data (streamData) whi
 ### "Optimize my Metal compute kernels" (GPU trace)
 1. Capture a `.gputrace` (see [Capturing GPU Traces](#capturing-gpu-traces))
 2. `profiler_gpu_open` to see kernel list, dispatch counts, command buffer structure
-3. `profiler_gpu_dependencies` at encoder or kernel scale to find the critical path
-4. `profiler_gpu_timeline` with kernel_filter to inspect specific dispatches (threadgroup sizes, buffer bindings)
-5. `profiler_gpu_counters` for shader performance metrics (requires Xcode replay)
-6. `profiler_gpu_export_perfetto` to create a visual timeline for the user
+3. `profiler_gpu_scheduling` to find scheduling overhead — inter-encoder gaps and fusion candidates
+4. `profiler_gpu_dependencies` at encoder or kernel scale to find the critical path
+5. `profiler_gpu_timeline` with kernel_filter to inspect specific dispatches (threadgroup sizes, buffer bindings)
+6. `profiler_gpu_counters` for shader performance metrics (requires Xcode replay)
+7. `profiler_gpu_export_perfetto` to create a visual timeline for the user
 
 ### "Which GPU dispatches could run in parallel?"
 1. `profiler_gpu_dependencies` with scale=dispatch to see the full buffer dependency DAG
@@ -218,11 +223,18 @@ The `profiler_gpu_counters` tool requires shader profiling data (streamData) whi
 4. Use `profiler_gpu_dependencies` with scale=kernel to see which kernel types have cross-dependencies
 
 ### "Profile both CPU and GPU sides"
-1. Record CPU: `xctrace record --template "Time Profiler" --launch -- ./app`
-2. Capture GPU: Run the app with `MTL_CAPTURE_ENABLED=1` (separate run, or use `MTLCaptureManager` for same run)
-3. CPU analysis: `profiler_top_functions` + `profiler_cpu_samples` on the `.trace`
-4. GPU analysis: `profiler_gpu_open` + `profiler_gpu_dependencies` on the `.gputrace`
-5. Compare: Are you CPU-bound (CPU hotspot in command encoding) or GPU-bound (long critical path in GPU DAG)?
+1. Record with Metal System Trace: `xctrace record --template "Metal System Trace" --time-limit 10s --launch -- ./app`
+2. `profiler_correlated_timeline` on the `.trace` to see CPU and GPU activity side by side with auto-detected phases
+3. Check the `summary.bottleneck` field — it tells you if the app is CPU_BOUND, GPU_BOUND, or BALANCED
+4. For GPU-bound workloads: capture a `.gputrace` and use `profiler_gpu_scheduling` to find if encoder consolidation would help
+5. For CPU-bound workloads: use `profiler_top_functions` to find the CPU hotspot (is it command encoding? shader compilation? data preparation?)
+
+### "Should I combine my GPU operations?"
+1. Capture a `.gputrace` with shader profiling data (see [Getting shader performance counters](#getting-shader-performance-counters))
+2. `profiler_gpu_scheduling` — check `summary.inter_encoder_gap_pct`. If >5%, combining encoders will help
+3. Check `encoder_gaps` for specific gaps and whether they're `COMBINABLE` (shared kernels) or `COMBINABLE_DIFFERENT_KERNELS` (different work but no CPU readback needed)
+4. Check `fusion_candidates` for sequences of many small dispatches that could be batched into fewer, larger ones
+5. Follow the `recommendations` — they're prioritized by potential savings
 
 ## All Available Instruments
 

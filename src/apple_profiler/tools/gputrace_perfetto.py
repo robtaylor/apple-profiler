@@ -46,6 +46,7 @@ Usage:
     uv run tools/gputrace_perfetto.py <path.gputrace> --format pftrace
     uv run tools/gputrace_perfetto.py <path.gputrace> --format pftrace --group-by cb
 """
+
 from __future__ import annotations
 
 import argparse
@@ -146,9 +147,7 @@ def _build_dispatch_duration_map(
                 dur[func_idx] = 1000  # 1µs fallback
         return dur
 
-    dispatch_indices = sorted(
-        ev.get("index", 0) for ev in events if ev.get("type") == "dispatch"
-    )
+    dispatch_indices = sorted(ev.get("index", 0) for ev in events if ev.get("type") == "dispatch")
     dur = {}
     for i, idx in enumerate(dispatch_indices):
         dur[idx] = dispatch_indices[i + 1] - idx if i + 1 < len(dispatch_indices) else 1
@@ -165,15 +164,23 @@ def _get_timestamp_ns(
     When *gpu_timestamps* is provided and contains *func_idx*, returns the
     real GPU timestamp (ts_begin or ts_end depending on *use_end*).
     Otherwise falls back to the synthetic ``func_idx * 1000`` scheme.
+    When *use_end* is True in the fallback, adds one slot (1000 ns) past
+    the func_idx to represent the span's end.
     """
     if gpu_timestamps:
         ts = gpu_timestamps.get(func_idx)
         if ts is not None:
             return ts[1] if use_end else ts[0]
+    # Synthetic fallback: use_end gives one slot past the dispatch
+    if use_end:
+        return (func_idx + 1) * 1000
     return func_idx * 1000
 
+
 def _update_range(
-    ranges: dict[int, tuple[int, int]], key: int, value: int,
+    ranges: dict[int, tuple[int, int]],
+    key: int,
+    value: int,
 ) -> None:
     """Update min/max range for a key."""
     if key in ranges:
@@ -184,7 +191,9 @@ def _update_range(
 
 
 def _update_range_str(
-    ranges: dict[str, tuple[int, int]], key: str, value: int,
+    ranges: dict[str, tuple[int, int]],
+    key: str,
+    value: int,
 ) -> None:
     if key in ranges:
         cur_min, cur_max = ranges[key]
@@ -266,78 +275,88 @@ def _group_by_pipeline(
             else:
                 dur_ns = 1000  # 1µs in synthetic mode
 
-            events.append({
-                "ph": "X",
-                "name": kernel,
-                "cat": "dispatch",
-                "pid": pid,
-                "tid": 0,
-                "ts": ts_ns / 1000,  # Chrome trace uses microseconds
-                "dur": dur_ns / 1000,
-                "args": args,
-            })
+            events.append(
+                {
+                    "ph": "X",
+                    "name": kernel,
+                    "cat": "dispatch",
+                    "pid": pid,
+                    "tid": 0,
+                    "ts": ts_ns / 1000,  # Chrome trace uses microseconds
+                    "dur": dur_ns / 1000,
+                    "args": args,
+                }
+            )
 
             _update_range_str(kernel_func_range, kernel, func_idx)
 
         elif etype == "barrier":
             scope = event.get("scope", "buffers")
             ts_ns = _get_timestamp_ns(func_idx, gpu_timestamps)
-            events.append({
-                "ph": "i",
-                "name": f"barrier ({scope})",
-                "cat": "barrier",
-                "pid": BARRIER_PID,
-                "tid": 0,
-                "ts": ts_ns / 1000,
-                "s": "t",
-                "args": {
-                    "scope": scope,
-                    "encoder": enc_idx,
-                    "cb": cb_idx,
-                },
-            })
+            events.append(
+                {
+                    "ph": "i",
+                    "name": f"barrier ({scope})",
+                    "cat": "barrier",
+                    "pid": BARRIER_PID,
+                    "tid": 0,
+                    "ts": ts_ns / 1000,
+                    "s": "t",
+                    "args": {
+                        "scope": scope,
+                        "encoder": enc_idx,
+                        "cb": cb_idx,
+                    },
+                }
+            )
 
     # Process name metadata for each kernel
     for kernel, pid in kernel_to_pid.items():
-        events.append({
-            "ph": "M",
-            "name": "process_name",
-            "pid": pid,
-            "tid": 0,
-            "args": {"name": kernel},
-        })
+        events.append(
+            {
+                "ph": "M",
+                "name": "process_name",
+                "pid": pid,
+                "tid": 0,
+                "args": {"name": kernel},
+            }
+        )
 
     # Process sort order: by first func_idx (earliest first)
     for kernel, pid in kernel_to_pid.items():
         fmin = kernel_func_range.get(kernel, (0, 0))[0]
-        events.append({
-            "ph": "M",
-            "name": "process_sort_index",
-            "pid": pid,
-            "tid": 0,
-            "args": {"sort_index": fmin},
-        })
+        events.append(
+            {
+                "ph": "M",
+                "name": "process_sort_index",
+                "pid": pid,
+                "tid": 0,
+                "args": {"sort_index": fmin},
+            }
+        )
 
     # Barrier process metadata (if any barriers exist)
-    has_barriers = any(
-        e.get("type") == "barrier" for e in data.get("events", [])
-    )
+    has_barriers = any(e.get("type") == "barrier" for e in data.get("events", []))
     if has_barriers:
-        events.append({
-            "ph": "M",
-            "name": "process_name",
-            "pid": BARRIER_PID,
-            "tid": 0,
-            "args": {"name": "Barriers"},
-        })
+        events.append(
+            {
+                "ph": "M",
+                "name": "process_name",
+                "pid": BARRIER_PID,
+                "tid": 0,
+                "args": {"name": "Barriers"},
+            }
+        )
         # Sort barriers to the end
-        events.append({
-            "ph": "M",
-            "name": "process_sort_index",
-            "pid": BARRIER_PID,
-            "tid": 0,
-            "args": {"sort_index": 999999},
-        })
+        events.append(
+            {
+                "ph": "M",
+                "name": "process_sort_index",
+                "pid": BARRIER_PID,
+                "tid": 0,
+                "args": {"sort_index": 999999},
+            }
+        )
 
     return {"traceEvents": events}
 
@@ -404,16 +423,18 @@ def _group_by_cb(
             else:
                 dur_ns = 1000
 
-            events.append({
-                "ph": "X",
-                "name": kernel,
-                "cat": "dispatch",
-                "pid": pid,
-                "tid": tid,
-                "ts": ts_ns / 1000,
-                "dur": dur_ns / 1000,
-                "args": args,
-            })
+            events.append(
+                {
+                    "ph": "X",
+                    "name": kernel,
+                    "cat": "dispatch",
+                    "pid": pid,
+                    "tid": tid,
+                    "ts": ts_ns / 1000,
+                    "dur": dur_ns / 1000,
+                    "args": args,
+                }
+            )
 
             _update_range(encoder_func_range, enc_idx, func_idx)
             _update_range(cb_func_range, cb_idx, func_idx)
@@ -421,16 +442,18 @@ def _group_by_cb(
         elif etype == "barrier":
             scope = event.get("scope", "buffers")
             ts_ns = _get_timestamp_ns(func_idx, gpu_timestamps)
-            events.append({
-                "ph": "i",
-                "name": f"barrier ({scope})",
-                "cat": "barrier",
-                "pid": pid,
-                "tid": tid,
-                "ts": ts_ns / 1000,
-                "s": "t",
-                "args": {"scope": scope},
-            })
+            events.append(
+                {
+                    "ph": "i",
+                    "name": f"barrier ({scope})",
+                    "cat": "barrier",
+                    "pid": pid,
+                    "tid": tid,
+                    "ts": ts_ns / 1000,
+                    "s": "t",
+                    "args": {"scope": scope},
+                }
+            )
 
             _update_range(encoder_func_range, enc_idx, func_idx)
             _update_range(cb_func_range, cb_idx, func_idx)
@@ -445,14 +468,26 @@ def _group_by_cb(
 
         ts_begin = _get_timestamp_ns(fmin, gpu_timestamps) / 1000
         ts_end = _get_timestamp_ns(fmax, gpu_timestamps, use_end=True) / 1000
-        events.append({
-            "ph": "B", "name": label, "cat": "encoder",
-            "pid": cb_idx, "tid": enc_idx, "ts": ts_begin,
-        })
-        events.append({
-            "ph": "E", "name": label, "cat": "encoder",
-            "pid": cb_idx, "tid": enc_idx, "ts": ts_end,
-        })
+        events.append(
+            {
+                "ph": "B",
+                "name": label,
+                "cat": "encoder",
+                "pid": cb_idx,
+                "tid": enc_idx,
+                "ts": ts_begin,
+            }
+        )
+        events.append(
+            {
+                "ph": "E",
+                "name": label,
+                "cat": "encoder",
+                "pid": cb_idx,
+                "tid": enc_idx,
+                "ts": ts_end,
+            }
+        )
 
     # CB overview spans on a dedicated tid
     CB_OVERVIEW_TID = -1
@@ -464,14 +499,26 @@ def _group_by_cb(
 
         ts_begin = _get_timestamp_ns(fmin, gpu_timestamps) / 1000
         ts_end = _get_timestamp_ns(fmax, gpu_timestamps, use_end=True) / 1000
-        events.append({
-            "ph": "B", "name": label, "cat": "command_buffer",
-            "pid": cb_idx, "tid": CB_OVERVIEW_TID, "ts": ts_begin,
-        })
-        events.append({
-            "ph": "E", "name": label, "cat": "command_buffer",
-            "pid": cb_idx, "tid": CB_OVERVIEW_TID, "ts": ts_end,
-        })
+        events.append(
+            {
+                "ph": "B",
+                "name": label,
+                "cat": "command_buffer",
+                "pid": cb_idx,
+                "tid": CB_OVERVIEW_TID,
+                "ts": ts_begin,
+            }
+        )
+        events.append(
+            {
+                "ph": "E",
+                "name": label,
+                "cat": "command_buffer",
+                "pid": cb_idx,
+                "tid": CB_OVERVIEW_TID,
+                "ts": ts_end,
+            }
+        )
 
     # Process name metadata
     for cb_idx in cb_func_range:
@@ -479,18 +526,27 @@ def _group_by_cb(
         name = f"CB #{cb_idx}"
         if addr:
             name += f" ({addr})"
-        events.append({
-            "ph": "M", "name": "process_name",
-            "pid": cb_idx, "tid": 0, "args": {"name": name},
-        })
+        events.append(
+            {
+                "ph": "M",
+                "name": "process_name",
+                "pid": cb_idx,
+                "tid": 0,
+                "args": {"name": name},
+            }
+        )
 
     # Thread name metadata
     for cb_idx in cb_func_range:
-        events.append({
-            "ph": "M", "name": "thread_name",
-            "pid": cb_idx, "tid": CB_OVERVIEW_TID,
-            "args": {"name": "CB Overview"},
-        })
+        events.append(
+            {
+                "ph": "M",
+                "name": "thread_name",
+                "pid": cb_idx,
+                "tid": CB_OVERVIEW_TID,
+                "args": {"name": "CB Overview"},
+            }
+        )
 
     for enc_idx in encoder_func_range:
         cb_idx = encoder_to_cb.get(enc_idx, 0)
@@ -498,11 +554,15 @@ def _group_by_cb(
         name = f"Encoder #{enc_idx}"
         if addr:
             name += f" ({addr})"
-        events.append({
-            "ph": "M", "name": "thread_name",
-            "pid": cb_idx, "tid": enc_idx,
-            "args": {"name": name},
-        })
+        events.append(
+            {
+                "ph": "M",
+                "name": "thread_name",
+                "pid": cb_idx,
+                "tid": enc_idx,
+                "args": {"name": name},
+            }
+        )
 
     return {"traceEvents": events}
 
@@ -541,6 +601,7 @@ def timeline_to_pftrace(
 
     if counters is not None:
         from perfetto.protos.perfetto.trace import perfetto_trace_pb2 as pb
+
         _add_gpu_counters(trace, pb, counters)
 
     return trace.SerializeToString()
@@ -682,9 +743,9 @@ def _pftrace_pipeline(
 
 
 # CB-grouped pftrace UUIDs
-_CB_PROCESS_BASE = 1000    # CB N -> 1000+N
-_CB_OVERVIEW_BASE = 2000   # CB overview N -> 2000+N
-_CB_ENCODER_BASE = 3000    # encoder N -> 3000+N
+_CB_PROCESS_BASE = 1000  # CB N -> 1000+N
+_CB_OVERVIEW_BASE = 2000  # CB overview N -> 2000+N
+_CB_ENCODER_BASE = 3000  # encoder N -> 3000+N
 _CB_PFTRACE_SEQ = 1
 
 
@@ -954,8 +1015,16 @@ def _counter_unit(name: str) -> str:
     """Return a Perfetto unit_name string for a counter based on its name."""
     if any(
         kw in name
-        for kw in ("Utilization", "Limiter", "Percent", "Rate",
-                    "Occupancy", "Ratio", "Miss Rate", "Compression")
+        for kw in (
+            "Utilization",
+            "Limiter",
+            "Percent",
+            "Rate",
+            "Occupancy",
+            "Ratio",
+            "Miss Rate",
+            "Compression",
+        )
     ):
         return "percent"
     if any(kw in name for kw in ("Bytes", "Bandwidth")):
@@ -1080,38 +1149,48 @@ def main() -> None:
     )
     parser.add_argument("gputrace", help="Path to .gputrace file")
     parser.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         help="Output path (default: <input_stem>_perfetto.<ext>)",
     )
     parser.add_argument(
-        "--group-by", choices=["pipeline", "cb"], default="pipeline",
+        "--group-by",
+        choices=["pipeline", "cb"],
+        default="pipeline",
         help="Track grouping: 'pipeline' (default) groups by kernel name, "
-             "'cb' groups by command buffer/encoder.",
+        "'cb' groups by command buffer/encoder.",
     )
     parser.add_argument(
-        "--format", choices=["json", "pftrace"], default="json",
+        "--format",
+        choices=["json", "pftrace"],
+        default="json",
         help="Output format: 'json' (default) for Chrome Trace Event JSON, "
-             "'pftrace' for Perfetto protobuf binary.",
+        "'pftrace' for Perfetto protobuf binary.",
     )
     parser.add_argument(
-        "--counters", action="store_true",
+        "--counters",
+        action="store_true",
         help="Include GPU performance counter tracks (requires shader profiling data)",
     )
     parser.add_argument(
-        "--replay", action="store_true",
+        "--replay",
+        action="store_true",
         help="If no counter data found, open gputrace in Xcode and click "
-             "Replay to trigger shader profiling (requires accessibility permissions)",
+        "Replay to trigger shader profiling (requires accessibility permissions)",
     )
     parser.add_argument(
-        "--open", action="store_true",
+        "--open",
+        action="store_true",
         help="Open ui.perfetto.dev in browser after export",
     )
     parser.add_argument(
-        "--json", action="store_true",
+        "--json",
+        action="store_true",
         help="Output export metadata as JSON to stdout (for MCP integration)",
     )
     parser.add_argument(
-        "--no-timestamps", action="store_true",
+        "--no-timestamps",
+        action="store_true",
         help="Disable real GPU timestamps (use synthetic func_idx ordering instead)",
     )
     args = parser.parse_args()
@@ -1148,13 +1227,15 @@ def main() -> None:
             except ImportError:
                 from gputrace_timeline import read_gputrace_counters  # type: ignore[no-redef]
             counter_data = read_gputrace_counters(
-                args.gputrace, replay=args.replay,
+                args.gputrace,
+                replay=args.replay,
             )
             if counter_data is not None:
                 # Filter to non-zero counters for summary
                 num_counters = len(counter_data["counter_names"])
                 num_nonzero = sum(
-                    1 for c in range(num_counters)
+                    1
+                    for c in range(num_counters)
                     if any(
                         counter_data["samples"][s][c] != 0.0
                         for s in range(counter_data["num_samples"])
@@ -1162,7 +1243,9 @@ def main() -> None:
                 )
                 log.info(
                     "GPU counters: %d total, %d non-zero, %d samples",
-                    num_counters, num_nonzero, counter_data["num_samples"],
+                    num_counters,
+                    num_nonzero,
+                    counter_data["num_samples"],
                 )
             else:
                 log.warning("No GPU counter data found (shader profiling not enabled?)")
@@ -1192,7 +1275,9 @@ def main() -> None:
 
     if args.format == "pftrace":
         trace_bytes = timeline_to_pftrace(
-            trace_data, group_by=args.group_by, counters=counter_data,
+            trace_data,
+            group_by=args.group_by,
+            counters=counter_data,
             gpu_timestamps=gpu_timestamps,
         )
         with open(output_path, "wb") as f:
@@ -1201,19 +1286,24 @@ def main() -> None:
         log.info("Wrote %d bytes to %s", output_size, output_path)
     else:
         perfetto = timeline_to_perfetto(
-            trace_data, group_by=args.group_by, gpu_timestamps=gpu_timestamps,
+            trace_data,
+            group_by=args.group_by,
+            gpu_timestamps=gpu_timestamps,
         )
         with open(output_path, "w") as f:
             json.dump(perfetto, f, indent=2)
-        output_size = os.path.getsize(output_path)
+        output_size = Path(output_path).stat().st_size
         num_events = len(perfetto["traceEvents"])
         log.info("Wrote %d events to %s", num_events, output_path)
 
     if args.json:
-        json.dump({
-            "output_path": str(Path(output_path).resolve()),
-            "size": output_size,
-        }, sys.stdout)
+        json.dump(
+            {
+                "output_path": str(Path(output_path).resolve()),
+                "size": output_size,
+            },
+            sys.stdout,
+        )
         return
 
     log.info("Open https://ui.perfetto.dev and drag in the file to view.")

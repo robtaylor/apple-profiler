@@ -23,6 +23,7 @@ baspacho sparse linear algebra workload. Indices may change across Xcode version
 
 See memory/gputrace-format.md for detailed format documentation.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -41,27 +42,53 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-import objc  # type: ignore[import-untyped]
-from Foundation import NSURL  # type: ignore[import-untyped]
-
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
-warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
-
 # ---------------------------------------------------------------------------
-# Apple private framework loading
+# Apple private framework loading (deferred until first use)
 # ---------------------------------------------------------------------------
 
 try:
     from ._frameworks import SHARED_FW, ensure_dyld_framework_path, load_frameworks
 except ImportError:
-    from _frameworks import SHARED_FW, ensure_dyld_framework_path, load_frameworks  # type: ignore[no-redef]
+    from _frameworks import (  # type: ignore[no-redef]
+        SHARED_FW,
+        ensure_dyld_framework_path,
+        load_frameworks,
+    )
 
-load_frameworks()
+# These are set by _init_objc_runtime() on first call to read_gputrace()
+_objc_initialized = False
+objc: Any = None  # type: ignore[no-redef]
+NSURL: Any = None  # type: ignore[no-redef]
+NSBundle: Any = None  # type: ignore[no-redef]
+DYCaptureArchive: Any = None
+DYFunctionTracer: Any = None
 
-DYCaptureArchive = objc.lookUpClass("DYCaptureArchive")
-DYFunctionTracer = objc.lookUpClass("DYFunctionTracer")
+
+def _init_objc_runtime() -> None:
+    """Load ObjC frameworks and look up classes. Called once on first use."""
+    global _objc_initialized, objc, NSURL, NSBundle
+    global DYCaptureArchive, DYFunctionTracer
+    if _objc_initialized:
+        return
+
+    import objc as _objc  # type: ignore[import-untyped]
+    from Foundation import NSURL as _NSURL  # type: ignore[import-untyped]
+    from Foundation import NSBundle as _NSBundle  # type: ignore[import-untyped]
+
+    objc = _objc
+    NSURL = _NSURL
+    NSBundle = _NSBundle
+
+    warnings.filterwarnings("ignore", category=_objc.ObjCPointerWarning)
+    load_frameworks()
+
+    DYCaptureArchive = _objc.lookUpClass("DYCaptureArchive")
+    DYFunctionTracer = _objc.lookUpClass("DYFunctionTracer")
+    _objc_initialized = True
+
 
 # ---------------------------------------------------------------------------
 # Function index → Metal API name mapping
@@ -113,10 +140,20 @@ FUNC_NAMES: dict[int, str] = {
 }
 
 # Function indices that need trace-text argument parsing.
-_TRACE_INDICES = frozenset({
-    -16290, -16299, -16352, -16355, -16338,
-    -16337, -16336, -16327, -16078, -16009,
-})
+_TRACE_INDICES = frozenset(
+    {
+        -16290,
+        -16299,
+        -16352,
+        -16355,
+        -16338,
+        -16337,
+        -16336,
+        -16327,
+        -16078,
+        -16009,
+    }
+)
 
 
 def _parse_hex_addrs(trace: str) -> list[int]:
@@ -140,6 +177,7 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
       pipelines      - {pipeline_addr: kernel_name}
       command_buffers - list of command buffer groups with their dispatches
     """
+    _init_objc_runtime()
     url = NSURL.fileURLWithPath_(path)
     archive = DYCaptureArchive.alloc().initWithURL_options_error_(url, 0, None)
     if archive is None:
@@ -166,8 +204,8 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
     tracer.setNativePointerSize_(8)
 
     # --- State tracking ---
-    kernels: dict[int, str] = {}      # function_addr → kernel_name
-    pipelines: dict[int, str] = {}    # pipeline_addr → kernel_name
+    kernels: dict[int, str] = {}  # function_addr → kernel_name
+    pipelines: dict[int, str] = {}  # pipeline_addr → kernel_name
     last_created_pipeline: str | None = None
     current_pipeline_name: str | None = None
     buffers_bound: dict[int, int] = {}
@@ -266,21 +304,25 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
             # Close any open encoder belonging to this CB
             if current_encoder_dispatches:
                 cb_idx = cb_info["cb_idx"] if cb_info else -1
-                compute_encoders.append({
-                    "encoder_idx": current_encoder_idx,
-                    "command_buffer_idx": cb_idx,
-                    "addr": current_encoder_addr,
-                    "dispatches": list(current_encoder_dispatches),
-                })
+                compute_encoders.append(
+                    {
+                        "encoder_idx": current_encoder_idx,
+                        "command_buffer_idx": cb_idx,
+                        "addr": current_encoder_addr,
+                        "dispatches": list(current_encoder_dispatches),
+                    }
+                )
                 current_encoder_dispatches = []
                 current_encoder_idx = -1
                 current_encoder_addr = ""
             if cb_info and cb_info["dispatches"]:
-                command_buffers.append({
-                    "func_idx": func_idx,
-                    "addr": cb_info["addr"],
-                    "dispatches": cb_info["dispatches"],
-                })
+                command_buffers.append(
+                    {
+                        "func_idx": func_idx,
+                        "addr": cb_info["addr"],
+                        "dispatches": cb_info["dispatches"],
+                    }
+                )
             if commit_key == current_cb_addr:
                 current_cb_addr = ""
 
@@ -289,13 +331,17 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
         elif idx == -16355:  # MTLCommandBuffer.computeCommandEncoder
             # Close any previous open encoder
             if current_encoder_dispatches:
-                cb_idx = active_cbs[current_cb_addr]["cb_idx"] if current_cb_addr in active_cbs else -1
-                compute_encoders.append({
-                    "encoder_idx": current_encoder_idx,
-                    "command_buffer_idx": cb_idx,
-                    "addr": current_encoder_addr,
-                    "dispatches": list(current_encoder_dispatches),
-                })
+                cb_idx = (
+                    active_cbs[current_cb_addr]["cb_idx"] if current_cb_addr in active_cbs else -1
+                )
+                compute_encoders.append(
+                    {
+                        "encoder_idx": current_encoder_idx,
+                        "command_buffer_idx": cb_idx,
+                        "addr": current_encoder_addr,
+                        "dispatches": list(current_encoder_dispatches),
+                    }
+                )
                 current_encoder_dispatches = []
             current_encoder_idx = encoder_counter
             encoder_counter += 1
@@ -318,13 +364,17 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
 
         elif idx in (-16325, -16370):  # endEncoding
             if current_encoder_dispatches:
-                cb_idx = active_cbs[current_cb_addr]["cb_idx"] if current_cb_addr in active_cbs else -1
-                compute_encoders.append({
-                    "encoder_idx": current_encoder_idx,
-                    "command_buffer_idx": cb_idx,
-                    "addr": current_encoder_addr,
-                    "dispatches": list(current_encoder_dispatches),
-                })
+                cb_idx = (
+                    active_cbs[current_cb_addr]["cb_idx"] if current_cb_addr in active_cbs else -1
+                )
+                compute_encoders.append(
+                    {
+                        "encoder_idx": current_encoder_idx,
+                        "command_buffer_idx": cb_idx,
+                        "addr": current_encoder_addr,
+                        "dispatches": list(current_encoder_dispatches),
+                    }
+                )
                 current_encoder_dispatches = []
                 current_encoder_idx = -1
                 current_encoder_addr = ""
@@ -337,11 +387,13 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
             # this call appears right after a pipeline creation.
             if last_created_pipeline:
                 current_pipeline_name = last_created_pipeline
-                events.append({
-                    "type": "set_pipeline",
-                    "kernel": current_pipeline_name,
-                    "index": func_idx,
-                })
+                events.append(
+                    {
+                        "type": "set_pipeline",
+                        "kernel": current_pipeline_name,
+                        "index": func_idx,
+                    }
+                )
             last_created_pipeline = None  # consumed
 
         elif idx == -16337:  # setBytes:length:atIndex:
@@ -353,12 +405,14 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                 for data_addr in _parse_hex_addrs(trace):
                     if data_addr in pipelines:
                         current_pipeline_name = pipelines[data_addr]
-                        events.append({
-                            "type": "set_pipeline",
-                            "kernel": current_pipeline_name,
-                            "pipeline_addr": data_addr,
-                            "index": func_idx,
-                        })
+                        events.append(
+                            {
+                                "type": "set_pipeline",
+                                "kernel": current_pipeline_name,
+                                "pipeline_addr": data_addr,
+                                "index": func_idx,
+                            }
+                        )
                         break
                     # Pre-capture pipeline: address isn't in the
                     # pipelines dict but looks like a pipeline pointer
@@ -369,12 +423,14 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
                     if data_addr > 0xFFFF:
                         name = f"Compute Pipeline 0x{data_addr:x}"
                         current_pipeline_name = name
-                        events.append({
-                            "type": "set_pipeline",
-                            "kernel": name,
-                            "pipeline_addr": data_addr,
-                            "index": func_idx,
-                        })
+                        events.append(
+                            {
+                                "type": "set_pipeline",
+                                "kernel": name,
+                                "pipeline_addr": data_addr,
+                                "index": func_idx,
+                            }
+                        )
                         break
 
         # ---- Buffer bindings ----
@@ -414,16 +470,12 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
             threads_per: tuple[int, ...] | None = None
 
             if trace and idx == -16327:
-                struct_matches = re.findall(
-                    r"\{(\d+)ul,\s*(\d+)ul,\s*(\d+)ul\}", trace
-                )
+                struct_matches = re.findall(r"\{(\d+)ul,\s*(\d+)ul,\s*(\d+)ul\}", trace)
                 if len(struct_matches) >= 2:
                     threadgroups = tuple(int(x) for x in struct_matches[0])
                     threads_per = tuple(int(x) for x in struct_matches[1])
             elif trace and idx == -16078:
-                struct_matches = re.findall(
-                    r"\{(\d+)ul,\s*(\d+)ul,\s*(\d+)ul\}", trace
-                )
+                struct_matches = re.findall(r"\{(\d+)ul,\s*(\d+)ul,\s*(\d+)ul\}", trace)
                 if len(struct_matches) >= 2:
                     threadgroups = tuple(int(x) for x in struct_matches[0])
                     threads_per = tuple(int(x) for x in struct_matches[1])
@@ -452,21 +504,25 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
     # Flush any open encoder
     if current_encoder_dispatches:
         cb_idx = active_cbs[current_cb_addr]["cb_idx"] if current_cb_addr in active_cbs else -1
-        compute_encoders.append({
-            "encoder_idx": current_encoder_idx,
-            "command_buffer_idx": cb_idx,
-            "addr": current_encoder_addr,
-            "dispatches": list(current_encoder_dispatches),
-        })
+        compute_encoders.append(
+            {
+                "encoder_idx": current_encoder_idx,
+                "command_buffer_idx": cb_idx,
+                "addr": current_encoder_addr,
+                "dispatches": list(current_encoder_dispatches),
+            }
+        )
 
     # Flush uncommitted CBs (stream may end before final commits)
     for cb_addr, cb_info in active_cbs.items():
         if cb_info["dispatches"]:
-            command_buffers.append({
-                "func_idx": -1,  # no commit event
-                "addr": cb_info["addr"],
-                "dispatches": cb_info["dispatches"],
-            })
+            command_buffers.append(
+                {
+                    "func_idx": -1,  # no commit event
+                    "addr": cb_info["addr"],
+                    "dispatches": cb_info["dispatches"],
+                }
+            )
 
     return {
         "metadata": metadata,
@@ -485,8 +541,7 @@ def read_gputrace(path: str) -> dict[str, Any] | None:
 
 # Additional framework path for shader profiler
 _GPU_DEBUGGER_PLUGIN = (
-    "/Applications/Xcode.app/Contents/PlugIns/GPUDebugger.ideplugin"
-    "/Contents/Frameworks"
+    "/Applications/Xcode.app/Contents/PlugIns/GPUDebugger.ideplugin/Contents/Frameworks"
 )
 
 _PROFILER_FRAMEWORK_NAMES = [
@@ -499,6 +554,7 @@ def _load_profiler_frameworks() -> bool:
 
     Returns True if all frameworks loaded successfully.
     """
+    _init_objc_runtime()
     # Shared framework dependencies
     for name in _PROFILER_FRAMEWORK_NAMES:
         bundle = NSBundle.bundleWithPath_(f"{SHARED_FW}/{name}.framework")
@@ -546,7 +602,9 @@ def _find_stream_data(gputrace_path: str) -> str | None:
     # 3. Glob the temp dir for any match containing the stem
     if os.path.isdir(_XCODE_PROFILING_DIR):
         pattern = os.path.join(
-            _XCODE_PROFILING_DIR, f"*{stem}*.gpuprofiler_raw", "streamData",
+            _XCODE_PROFILING_DIR,
+            f"*{stem}*.gpuprofiler_raw",
+            "streamData",
         )
         matches = globmod.glob(pattern)
         if matches:
@@ -563,7 +621,9 @@ def _run_jxa(action: str, *args: str) -> dict[str, Any] | str | None:
     cmd = ["osascript", "-l", "JavaScript", _JXA_SCRIPT_PATH, action, *args]
     try:
         out = subprocess.check_output(
-            cmd, stderr=subprocess.STDOUT, timeout=15,
+            cmd,
+            stderr=subprocess.STDOUT,
+            timeout=15,
         )
         text = out.decode().strip()
         if text.startswith("{"):
@@ -628,7 +688,9 @@ def _replay_gputrace(gputrace_path: str, timeout: int = 120) -> str | None:
     log.info("Opening %s in Xcode for replay...", abs_path)
     try:
         subprocess.run(
-            ["open", "-g", "-a", "Xcode", abs_path], check=True, timeout=10,
+            ["open", "-g", "-a", "Xcode", abs_path],
+            check=True,
+            timeout=10,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         log.warning("Failed to open gputrace in Xcode: %s", e)
@@ -672,7 +734,9 @@ def _replay_gputrace(gputrace_path: str, timeout: int = 120) -> str | None:
             sd_path = Path(new_sd)
             log.info(
                 "Profiling complete after %ds: %s (%d bytes)",
-                i + 1, new_sd, sd_path.stat().st_size,
+                i + 1,
+                new_sd,
+                sd_path.stat().st_size,
             )
             if not window_closed:
                 _run_jxa("close-window", stem)
@@ -741,7 +805,9 @@ def _extract_mio_counter(
 
     # Pointer-returning objc_msgSend
     objc_msgSend_ptr = ctypes.CFUNCTYPE(
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
     )(("objc_msgSend", libobjc))
 
     counter_ptr = objc.pyobjc_id(counter)
@@ -841,21 +907,25 @@ def _load_mio_timeline(
         log.warning("Failed to read streamData at %s", stream_path)
         return None
 
-    allowlist = NSSet.setWithArray_([
-        GTShaderProfilerStreamData,
-        GTMutableShaderProfilerStreamData,
-        objc.lookUpClass("NSMutableArray"),
-        objc.lookUpClass("NSMutableDictionary"),
-        objc.lookUpClass("NSMutableData"),
-        objc.lookUpClass("NSArray"),
-        objc.lookUpClass("NSDictionary"),
-        objc.lookUpClass("NSData"),
-        objc.lookUpClass("NSString"),
-        objc.lookUpClass("NSNumber"),
-    ])
+    allowlist = NSSet.setWithArray_(
+        [
+            GTShaderProfilerStreamData,
+            GTMutableShaderProfilerStreamData,
+            objc.lookUpClass("NSMutableArray"),
+            objc.lookUpClass("NSMutableDictionary"),
+            objc.lookUpClass("NSMutableData"),
+            objc.lookUpClass("NSArray"),
+            objc.lookUpClass("NSDictionary"),
+            objc.lookUpClass("NSData"),
+            objc.lookUpClass("NSString"),
+            objc.lookUpClass("NSNumber"),
+        ]
+    )
 
     result = NSKeyedUnarchiver.unarchivedObjectOfClasses_fromData_error_(
-        allowlist, data, None,
+        allowlist,
+        data,
+        None,
     )
     sd = result[0] if isinstance(result, tuple) else result
     if sd is None:
@@ -864,8 +934,6 @@ def _load_mio_timeline(
 
     # Set _dataFileURL so processAPSTimelineData can find external raw files
     # (Counter_f_N.raw, Timeline_f_N.raw, etc.) in the streamData directory.
-    from Foundation import NSURL  # type: ignore[import-untyped]
-
     base_dir = os.path.dirname(stream_path)
     sd.setValue_forKey_(NSURL.fileURLWithPath_(base_dir), "_dataFileURL")
 
@@ -875,8 +943,9 @@ def _load_mio_timeline(
         return None
 
     log.info("Processing streamData via MIO pipeline (this may take a moment)...")
-    processor = GTShaderProfilerStreamDataProcessor.alloc() \
-        .initWithStreamData_llvmHelperPath_(sd, _LLVM_HELPER_PATH)
+    processor = GTShaderProfilerStreamDataProcessor.alloc().initWithStreamData_llvmHelperPath_(
+        sd, _LLVM_HELPER_PATH
+    )
 
     # Suppress noisy GTLLVMHelper stderr/stdout (LLVM warnings, GPU core info)
     saved_stderr = os.dup(2)
@@ -945,7 +1014,9 @@ def read_gputrace_timestamps(
     Returns None if streamData is missing or MIO pipeline fails.
     """
     loaded = _load_mio_timeline(
-        gputrace_path, replay=replay, replay_timeout=replay_timeout,
+        gputrace_path,
+        replay=replay,
+        replay_timeout=replay_timeout,
     )
     if loaded is None:
         return None
@@ -955,8 +1026,9 @@ def read_gputrace_timestamps(
     draw_count = timeline.drawCount()
     dt_count = timeline.drawTraceCount()
     if draw_count == 0 or dt_count == 0:
-        log.info("No draws in MIO timeline (draw_count=%d, drawTraceCount=%d)",
-                 draw_count, dt_count)
+        log.info(
+            "No draws in MIO timeline (draw_count=%d, drawTraceCount=%d)", draw_count, dt_count
+        )
         return None
 
     # Access raw C arrays via objc_msgSend (pyobjc can't bridge raw pointers)
@@ -965,7 +1037,9 @@ def read_gputrace_timestamps(
     sel_registerName.restype = ctypes.c_void_p
     sel_registerName.argtypes = [ctypes.c_char_p]
     objc_msgSend_ptr = ctypes.CFUNCTYPE(
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
     )(("objc_msgSend", libobjc))
     tl_ptr = objc.pyobjc_id(timeline)
 
@@ -1008,9 +1082,7 @@ def read_gputrace_timestamps(
     if event_data is not None:
         # Extract dispatch func_idx values in order from the event stream
         dispatch_func_indices = [
-            ev["index"]
-            for ev in event_data.get("events", [])
-            if ev.get("type") == "dispatch"
+            ev["index"] for ev in event_data.get("events", []) if ev.get("type") == "dispatch"
         ]
         for i, func_idx in enumerate(dispatch_func_indices):
             if i < len(draw_timestamps) and draw_timestamps[i] != (0, 0):
@@ -1034,7 +1106,10 @@ def read_gputrace_timestamps(
 
     log.info(
         "Extracted %d/%d dispatch timestamps (timeline: %.2f ms, GPU active: %.2f ms)",
-        n_valid, n_draws, ts_end_timeline / 1e6, gpu_time / 1e6,
+        n_valid,
+        n_draws,
+        ts_end_timeline / 1e6,
+        gpu_time / 1e6,
     )
 
     return {
@@ -1071,7 +1146,9 @@ def read_gputrace_counters(
                        sample i, counter j
     """
     loaded = _load_mio_timeline(
-        gputrace_path, replay=replay, replay_timeout=replay_timeout,
+        gputrace_path,
+        replay=replay,
+        replay_timeout=replay_timeout,
     )
     if loaded is None:
         return None
@@ -1081,19 +1158,18 @@ def read_gputrace_counters(
     if timeline.profiledState() != 2:
         if replay:
             log.info(
-                "streamData has profiledState=%d (not profiled) "
-                "— triggering Xcode replay...",
+                "streamData has profiledState=%d (not profiled) — triggering Xcode replay...",
                 timeline.profiledState(),
             )
             new_path = _replay_gputrace(gputrace_path, timeout=replay_timeout)
             if new_path is not None:
                 return read_gputrace_counters(
-                    gputrace_path, replay=False,
+                    gputrace_path,
+                    replay=False,
                     replay_timeout=replay_timeout,
                 )
         log.info(
-            "profiledState=%d — no counter data. "
-            "Replay with shader profiling enabled.",
+            "profiledState=%d — no counter data. Replay with shader profiling enabled.",
             timeline.profiledState(),
         )
         return None
@@ -1145,9 +1221,7 @@ def read_gputrace_counters(
     all_counters.sort(key=lambda x: _counter_sort_key(x[0]))
 
     # Extract timestamps from first primary-rate counter
-    first_primary = next(
-        obj for _, obj, resample in all_counters if not resample
-    )
+    first_primary = next(obj for _, obj, resample in all_counters if not resample)
     timestamps, _ = _extract_mio_counter(first_primary, num_samples)
 
     # Build counter_names and samples in priority order
@@ -1168,10 +1242,11 @@ def read_gputrace_counters(
             samples[s].append(values[s])
 
     log.info(
-        "Extracted %d counters x %d samples from MIO timeline "
-        "(%d primary-rate, %d resampled)",
-        len(counter_names), num_samples,
-        len(counter_names) - n_resampled, n_resampled,
+        "Extracted %d counters x %d samples from MIO timeline (%d primary-rate, %d resampled)",
+        len(counter_names),
+        num_samples,
+        len(counter_names) - n_resampled,
+        n_resampled,
     )
 
     return {
@@ -1219,14 +1294,11 @@ def _print_human_readable(path: str, result: dict[str, Any]) -> None:
         tg = evt.get("threadgroups", "?")
         tpt = evt.get("threads_per_threadgroup", "")
         bufs = len(evt.get("buffers_bound", {}))
-        print(
-            f"  [{evt['index']:5d}] {evt['kernel']:45s} "
-            f"tg={tg} tpt={tpt} bufs={bufs}"
-        )
+        print(f"  [{evt['index']:5d}] {evt['kernel']:45s} tg={tg} tpt={tpt} bufs={bufs}")
 
     print(f"\nCompute encoders: {len(result['compute_encoders'])}")
     for i, enc in enumerate(result["compute_encoders"][:10]):
-        addr = enc.get('addr', '')
+        addr = enc.get("addr", "")
         addr_str = f" {addr}" if addr else ""
         print(
             f"  Encoder#{enc['encoder_idx']}{addr_str}: {len(enc['dispatches'])} dispatches "
@@ -1235,11 +1307,9 @@ def _print_human_readable(path: str, result: dict[str, Any]) -> None:
 
     print(f"\nCommand buffers: {len(result['command_buffers'])}")
     for i, cb in enumerate(result["command_buffers"][:10]):
-        addr = cb.get('addr', '')
+        addr = cb.get("addr", "")
         addr_str = f" {addr}" if addr else ""
-        print(
-            f"  CB#{i}{addr_str}: {len(cb['dispatches'])} dispatches"
-        )
+        print(f"  CB#{i}{addr_str}: {len(cb['dispatches'])} dispatches")
         cb_kernels: dict[str, int] = defaultdict(int)
         for d in cb["dispatches"]:
             cb_kernels[d["kernel"]] += 1
