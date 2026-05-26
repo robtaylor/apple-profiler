@@ -1,0 +1,1213 @@
+{
+  "tools": [
+    {
+      "name": "profiler_open_trace",
+      "description": "Open a .trace file and return its metadata and available tables.\n\nThis is typically the first tool to call. It parses the trace's table of\ncontents and returns device info, recording duration, target process, and\na list of all available data tables.\n\nReturns:\n    JSON with trace info and available table schemas.\n",
+      "inputSchema": {
+        "$defs": {
+          "TracePathInput": {
+            "description": "Input requiring a trace file path.",
+            "properties": {
+              "trace_path": {
+                "description": "Path to the .trace file",
+                "minLength": 1,
+                "title": "Trace Path",
+                "type": "string"
+              }
+            },
+            "required": [
+              "trace_path"
+            ],
+            "title": "TracePathInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/TracePathInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_open_traceArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_open_traceOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Open Trace File",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_cpu_samples",
+      "description": "Get CPU profile samples, each with a full stack trace (backtrace).\n\nEach sample includes timestamp, thread, process, CPU core, thread state,\ncycle weight, and full backtrace with symbol names and binary info.\nWorks with traces from CPU Profiler, Time Profiler, and Metal System Trace.\nOptionally filter to a time range using start_time_ns / end_time_ns.\n\nReturns:\n    JSON array of CPU samples with backtraces.\n",
+      "inputSchema": {
+        "$defs": {
+          "CpuSamplesInput": {
+            "description": "Input for querying CPU samples.",
+            "properties": {
+              "trace_path": {
+                "description": "Path to the .trace file",
+                "minLength": 1,
+                "title": "Trace Path",
+                "type": "string"
+              },
+              "limit": {
+                "anyOf": [
+                  {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Maximum number of samples to return. None returns all.",
+                "title": "Limit"
+              },
+              "start_time_ns": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Include only samples at or after this timestamp (nanoseconds).",
+                "title": "Start Time Ns"
+              },
+              "end_time_ns": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Include only samples at or before this timestamp (nanoseconds).",
+                "title": "End Time Ns"
+              }
+            },
+            "required": [
+              "trace_path"
+            ],
+            "title": "CpuSamplesInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/CpuSamplesInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_cpu_samplesArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_cpu_samplesOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Get CPU Samples with Stack Traces",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_top_functions",
+      "description": "Get the top N functions by total CPU cycle weight.\n\nAggregates cycle weights across all samples for each function symbol,\nreturning the heaviest functions first. Useful for identifying CPU hotspots.\nWorks with traces from CPU Profiler, Time Profiler, and Metal System Trace.\nOptionally scope to a time range using start_time_ns / end_time_ns.\n\nReturns:\n    JSON array of {function, total_weight} sorted by weight descending.\n",
+      "inputSchema": {
+        "$defs": {
+          "TopFunctionsInput": {
+            "description": "Input for top functions query.",
+            "properties": {
+              "trace_path": {
+                "description": "Path to the .trace file",
+                "minLength": 1,
+                "title": "Trace Path",
+                "type": "string"
+              },
+              "n": {
+                "default": 20,
+                "description": "Number of top functions to return",
+                "maximum": 500,
+                "minimum": 1,
+                "title": "N",
+                "type": "integer"
+              },
+              "start_time_ns": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Include only samples at or after this timestamp (nanoseconds).",
+                "title": "Start Time Ns"
+              },
+              "end_time_ns": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Include only samples at or before this timestamp (nanoseconds).",
+                "title": "End Time Ns"
+              }
+            },
+            "required": [
+              "trace_path"
+            ],
+            "title": "TopFunctionsInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/TopFunctionsInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_top_functionsArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_top_functionsOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Top Functions by Cycle Weight",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_hangs",
+      "description": "Get all detected hangs/unresponsiveness intervals from a trace.\n\nReturns hang type (Severe Hang, Hang), duration, affected process/thread.\nRequires the trace to have been recorded with the Hangs instrument.\n\nReturns:\n    JSON array of hang intervals.\n",
+      "inputSchema": {
+        "$defs": {
+          "TracePathInput": {
+            "description": "Input requiring a trace file path.",
+            "properties": {
+              "trace_path": {
+                "description": "Path to the .trace file",
+                "minLength": 1,
+                "title": "Trace Path",
+                "type": "string"
+              }
+            },
+            "required": [
+              "trace_path"
+            ],
+            "title": "TracePathInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/TracePathInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_hangsArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_hangsOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Get Detected Hangs",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_signpost_events",
+      "description": "Get os-signpost events with optional filtering.\n\nReturns raw Begin/End/Event signpost entries. Filter by subsystem,\ncategory, or signpost name to focus on specific instrumentation.\n\nReturns:\n    JSON array of signpost events.\n",
+      "inputSchema": {
+        "$defs": {
+          "SignpostFilterInput": {
+            "description": "Input for querying signpost events or intervals with filtering.",
+            "properties": {
+              "trace_path": {
+                "description": "Path to the .trace file",
+                "minLength": 1,
+                "title": "Trace Path",
+                "type": "string"
+              },
+              "subsystem": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter by subsystem (e.g., 'com.apple.SkyLight')",
+                "title": "Subsystem"
+              },
+              "category": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter by category (e.g., 'networking')",
+                "title": "Category"
+              },
+              "name": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter by signpost name (e.g., 'NetworkRequest')",
+                "title": "Name"
+              },
+              "limit": {
+                "anyOf": [
+                  {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Maximum number of results to return. None returns all.",
+                "title": "Limit"
+              }
+            },
+            "required": [
+              "trace_path"
+            ],
+            "title": "SignpostFilterInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/SignpostFilterInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_signpost_eventsArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_signpost_eventsOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Get Signpost Events",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_signpost_intervals",
+      "description": "Get matched signpost intervals (begin+end pairs) with optional filtering.\n\nReturns paired intervals with start time, duration, and start/end messages.\nFilter by subsystem, category, or signpost name.\n\nReturns:\n    JSON array of signpost intervals with durations.\n",
+      "inputSchema": {
+        "$defs": {
+          "SignpostFilterInput": {
+            "description": "Input for querying signpost events or intervals with filtering.",
+            "properties": {
+              "trace_path": {
+                "description": "Path to the .trace file",
+                "minLength": 1,
+                "title": "Trace Path",
+                "type": "string"
+              },
+              "subsystem": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter by subsystem (e.g., 'com.apple.SkyLight')",
+                "title": "Subsystem"
+              },
+              "category": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter by category (e.g., 'networking')",
+                "title": "Category"
+              },
+              "name": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter by signpost name (e.g., 'NetworkRequest')",
+                "title": "Name"
+              },
+              "limit": {
+                "anyOf": [
+                  {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Maximum number of results to return. None returns all.",
+                "title": "Limit"
+              }
+            },
+            "required": [
+              "trace_path"
+            ],
+            "title": "SignpostFilterInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/SignpostFilterInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_signpost_intervalsArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_signpost_intervalsOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Get Signpost Intervals",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_query_table",
+      "description": "Query any data table by schema name, returning rows as JSON.\n\nThis is a generic tool for accessing any table in the trace, including\nMetal GPU tables (metal-gpu-intervals, metal-driver-intervals,\nmetal-application-command-buffer-submissions, etc.), thermal data,\nor any other instrument data.\n\nUse profiler_list_tables first to discover available schemas.\nEach row is returned as a dict mapping column mnemonics to values.\n\nReturns:\n    JSON with schema info, column definitions, and row data.\n",
+      "inputSchema": {
+        "$defs": {
+          "TableQueryInput": {
+            "description": "Input for querying any table by schema name.",
+            "properties": {
+              "trace_path": {
+                "description": "Path to the .trace file",
+                "minLength": 1,
+                "title": "Trace Path",
+                "type": "string"
+              },
+              "schema": {
+                "description": "The table schema name to query (e.g., 'metal-gpu-intervals', 'metal-driver-intervals', 'metal-application-command-buffer-submissions'). Use profiler_list_tables to discover available schemas.",
+                "minLength": 1,
+                "title": "Schema",
+                "type": "string"
+              },
+              "limit": {
+                "anyOf": [
+                  {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Maximum number of rows to return. None returns all.",
+                "title": "Limit"
+              }
+            },
+            "required": [
+              "trace_path",
+              "schema"
+            ],
+            "title": "TableQueryInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/TableQueryInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_query_tableArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_query_tableOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Query Any Table by Schema",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_list_tables",
+      "description": "List all data tables available in the trace.\n\nEach table has a schema name (e.g., 'cpu-profile', 'potential-hangs',\n'os-signpost') and optional attributes like target-pid or codes.\n\nReturns:\n    JSON array of table schemas and their attributes.\n",
+      "inputSchema": {
+        "$defs": {
+          "TracePathInput": {
+            "description": "Input requiring a trace file path.",
+            "properties": {
+              "trace_path": {
+                "description": "Path to the .trace file",
+                "minLength": 1,
+                "title": "Trace Path",
+                "type": "string"
+              }
+            },
+            "required": [
+              "trace_path"
+            ],
+            "title": "TracePathInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/TracePathInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_list_tablesArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_list_tablesOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "List Available Tables",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_correlated_timeline",
+      "description": "Build a time-aligned correlated CPU+GPU timeline from a Metal System Trace.\n\nShows CPU and GPU activity side by side in aligned time buckets,\nwith automatic phase detection (CPU_BOUND, GPU_BOUND, BALANCED, IDLE).\n\nThis is the primary tool for understanding CPU/GPU interaction patterns:\npipeline bubbles, encoding bottlenecks, and GPU-bound regions become\nimmediately visible in the unified timeline.\n\nRequires a .trace file recorded with the Metal System Trace template\n(which captures both time-profile CPU samples and metal-gpu-intervals).\n\nReturns:\n    JSON with timeline buckets, detected phases, and summary analysis.\n",
+      "inputSchema": {
+        "$defs": {
+          "CorrelatedTimelineInput": {
+            "description": "Input for correlated CPU+GPU timeline analysis.",
+            "properties": {
+              "trace_path": {
+                "description": "Path to a Metal System Trace .trace file",
+                "minLength": 1,
+                "title": "Trace Path",
+                "type": "string"
+              },
+              "num_buckets": {
+                "anyOf": [
+                  {
+                    "maximum": 500,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Number of time buckets (default: auto 20-50). Lower = more summary, higher = more detail.",
+                "title": "Num Buckets"
+              },
+              "bucket_ms": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Explicit bucket width in milliseconds (overrides num_buckets).",
+                "title": "Bucket Ms"
+              },
+              "target_process": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter CPU samples to a specific process name (substring match).",
+                "title": "Target Process"
+              }
+            },
+            "required": [
+              "trace_path"
+            ],
+            "title": "CorrelatedTimelineInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/CorrelatedTimelineInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_correlated_timelineArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_correlated_timelineOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Correlated CPU+GPU Timeline",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_gpu_open",
+      "description": "Open a .gputrace and return structural overview.\n\nReturns metadata, kernel list, command buffer/encoder structure,\nand dispatch counts. Use this first to understand the GPU workload\nbefore diving into dependencies or counters.\n",
+      "inputSchema": {
+        "$defs": {
+          "GpuTracePathInput": {
+            "description": "Input requiring a .gputrace file path.",
+            "properties": {
+              "gputrace_path": {
+                "description": "Path to .gputrace file",
+                "minLength": 1,
+                "title": "Gputrace Path",
+                "type": "string"
+              }
+            },
+            "required": [
+              "gputrace_path"
+            ],
+            "title": "GpuTracePathInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/GpuTracePathInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_gpu_openArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_gpu_openOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Open GPU Trace",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_gpu_timeline",
+      "description": "Get detailed Metal API timeline events from a .gputrace.\n\nReturns dispatch events with kernel names, threadgroup sizes,\nbuffer bindings, and barrier events. Use filters to scope to\nspecific command buffers, encoders, or kernel patterns.\n",
+      "inputSchema": {
+        "$defs": {
+          "GpuTimelineInput": {
+            "description": "Input for GPU timeline queries with filtering.",
+            "properties": {
+              "gputrace_path": {
+                "description": "Path to .gputrace file",
+                "minLength": 1,
+                "title": "Gputrace Path",
+                "type": "string"
+              },
+              "kernel_filter": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Glob pattern to filter by kernel name (e.g., 'lu_factor*')",
+                "title": "Kernel Filter"
+              },
+              "cb_filter": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter to specific command buffer index",
+                "title": "Cb Filter"
+              },
+              "encoder_filter": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter to specific encoder index",
+                "title": "Encoder Filter"
+              },
+              "limit": {
+                "anyOf": [
+                  {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Max events to return",
+                "title": "Limit"
+              },
+              "offset": {
+                "default": 0,
+                "description": "Skip first N events",
+                "minimum": 0,
+                "title": "Offset",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "gputrace_path"
+            ],
+            "title": "GpuTimelineInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/GpuTimelineInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_gpu_timelineArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_gpu_timelineOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "GPU Timeline Events",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_gpu_dependencies",
+      "description": "Analyze buffer dependencies between GPU dispatches.\n\nReturns dependency DAG with critical path length, parallelism\nmetrics, per-kernel edge counts, and buffer hazard details.\nUse scale parameter to view at dispatch, encoder, kernel, or\ncommand buffer granularity.\n",
+      "inputSchema": {
+        "$defs": {
+          "GpuDepsInput": {
+            "description": "Input for GPU dependency graph analysis.",
+            "properties": {
+              "gputrace_path": {
+                "description": "Path to .gputrace file",
+                "minLength": 1,
+                "title": "Gputrace Path",
+                "type": "string"
+              },
+              "scale": {
+                "default": "encoder",
+                "description": "Graph scale: dispatch, encoder, kernel, or cb",
+                "title": "Scale",
+                "type": "string"
+              },
+              "kernel_filter": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Glob pattern to filter kernels",
+                "title": "Kernel Filter"
+              },
+              "cb_filter": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter to command buffer index",
+                "title": "Cb Filter"
+              },
+              "encoder_filter": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter to encoder index",
+                "title": "Encoder Filter"
+              }
+            },
+            "required": [
+              "gputrace_path"
+            ],
+            "title": "GpuDepsInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/GpuDepsInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_gpu_dependenciesArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_gpu_dependenciesOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "GPU Dependency Graph",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_gpu_counters",
+      "description": "Get GPU performance counter data from shader profiling.\n\nReturns counter values from the MIO pipeline \u2014 occupancy, memory\nbandwidth, instruction throughput, cache hit rates, etc. Requires\nstreamData from Xcode shader profiling (Replay with Profile enabled).\n\nUse summary=true (default) for quick stats per counter, or\nsummary=false for full time-series data.\n",
+      "inputSchema": {
+        "$defs": {
+          "GpuCountersInput": {
+            "description": "Input for GPU performance counter queries.",
+            "properties": {
+              "gputrace_path": {
+                "description": "Path to .gputrace file",
+                "minLength": 1,
+                "title": "Gputrace Path",
+                "type": "string"
+              },
+              "counter_filter": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Specific counter names to return (default: all)",
+                "title": "Counter Filter"
+              },
+              "summary": {
+                "default": true,
+                "description": "Return summary stats (min/max/avg) instead of full time-series",
+                "title": "Summary",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "gputrace_path"
+            ],
+            "title": "GpuCountersInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/GpuCountersInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_gpu_countersArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_gpu_countersOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "GPU Performance Counters",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_gpu_export_perfetto",
+      "description": "Export GPU trace to Perfetto .pftrace format for visualization.\n\nCreates a .pftrace file viewable at ui.perfetto.dev with GPU dispatch\ntimeline, barrier events, and optionally performance counter tracks.\n",
+      "inputSchema": {
+        "$defs": {
+          "GpuExportInput": {
+            "description": "Input for GPU trace Perfetto export.",
+            "properties": {
+              "gputrace_path": {
+                "description": "Path to .gputrace file",
+                "minLength": 1,
+                "title": "Gputrace Path",
+                "type": "string"
+              },
+              "output_path": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Output .pftrace path (default: auto-generated)",
+                "title": "Output Path"
+              },
+              "group_by": {
+                "default": "pipeline",
+                "description": "Track grouping: 'pipeline' groups by kernel name, 'cb' groups by command buffer/encoder",
+                "title": "Group By",
+                "type": "string"
+              },
+              "include_counters": {
+                "default": true,
+                "description": "Include GPU performance counter tracks",
+                "title": "Include Counters",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "gputrace_path"
+            ],
+            "title": "GpuExportInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/GpuExportInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_gpu_export_perfettoArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_gpu_export_perfettoOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Export GPU Trace to Perfetto",
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "profiler_gpu_scheduling",
+      "description": "Analyze GPU dispatch scheduling overhead to find optimization opportunities.\n\nIdentifies where combining GPU operations would speed things up by\neliminating CPU-GPU scheduling gaps. Uses real GPU hardware timestamps\nto measure:\n\n1. Inter-encoder gaps: Time the GPU sits idle between command encoder\n   submissions (the CPU-GPU roundtrip cost). Combining encoders\n   eliminates these gaps entirely.\n\n2. Dispatch fusion candidates: Sequences of many small dispatches of\n   the same kernel that could be replaced by fewer, larger dispatches.\n\nReturns per-encoder timing breakdown, gap analysis with combine\nassessments, fusion candidates, and prioritized recommendations\nwith estimated savings.\n\nRequires shader profiling data (streamData) in the .gputrace bundle.\n",
+      "inputSchema": {
+        "$defs": {
+          "GpuTracePathInput": {
+            "description": "Input requiring a .gputrace file path.",
+            "properties": {
+              "gputrace_path": {
+                "description": "Path to .gputrace file",
+                "minLength": 1,
+                "title": "Gputrace Path",
+                "type": "string"
+              }
+            },
+            "required": [
+              "gputrace_path"
+            ],
+            "title": "GpuTracePathInput",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/GpuTracePathInput"
+          }
+        },
+        "required": [
+          "params"
+        ],
+        "title": "profiler_gpu_schedulingArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "profiler_gpu_schedulingOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "title": "Analyze GPU Scheduling Overhead",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    }
+  ],
+  "server_info": {
+    "name": "apple_profiler_mcp",
+    "version": "0.3.3"
+  }
+}
